@@ -37,6 +37,13 @@ export interface Participant {
   synced: 0 | 1;
 }
 
+// Team entries share one bib_number/team_name row instead of first/last name.
+export function participantDisplayName(
+  p: Pick<Participant, 'first_name' | 'last_name' | 'team_name'>,
+): string {
+  return p.team_name ?? ([p.first_name, p.last_name].filter(Boolean).join(' ') || '—');
+}
+
 export interface Timestamp {
   id: string;
   race_id: string;
@@ -467,9 +474,11 @@ export async function markTimestampSynced(
 // ── Review ────────────────────────────────────────────────────────────────────
 
 export interface ReviewRow {
-  timestamp_id: string;
-  sequence_num: number;
-  recorded_at: number;
+  // null for a direct-entry finish (bib typed with no Timer device running —
+  // see the second half of the UNION below), never null for a gap row.
+  timestamp_id: string | null;
+  sequence_num: number | null;
+  recorded_at: number | null;
   finish_id: string | null;
   bib_number: string | null;
   gun_time: number | null;
@@ -479,6 +488,12 @@ export async function getReviewRows(
   db: SQLite.SQLiteDatabase,
   raceId: string,
 ): Promise<ReviewRow[]> {
+  // SQLite has no FULL OUTER JOIN, so this is a manual one via UNION ALL:
+  // timestamps left-joined to finishes (covers matched + unmatched-timestamp
+  // "gap" rows) UNION finishes that were never joined to a timestamp at all —
+  // i.e. bibs typed on this device with no Timer device running. Without the
+  // second half, a bib-only race (no timestamps table rows whatsoever) would
+  // show as empty even though it has results.
   return db.getAllAsync<ReviewRow>(
     `SELECT
        t.id         AS timestamp_id,
@@ -490,8 +505,21 @@ export async function getReviewRows(
      FROM timestamps t
      LEFT JOIN finishes f ON f.timestamp_id = t.id
      WHERE t.race_id = ?
-     ORDER BY t.sequence_num`,
-    [raceId],
+
+     UNION ALL
+
+     SELECT
+       NULL AS timestamp_id,
+       NULL AS sequence_num,
+       NULL AS recorded_at,
+       f.id AS finish_id,
+       f.bib_number,
+       f.gun_time
+     FROM finishes f
+     WHERE f.race_id = ? AND f.timestamp_id IS NULL
+
+     ORDER BY sequence_num IS NULL, sequence_num`,
+    [raceId, raceId],
   );
 }
 

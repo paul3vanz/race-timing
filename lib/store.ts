@@ -7,6 +7,7 @@ import { create } from 'zustand';
 import {
   assignBibToTimestamp,
   getFinishesByRace,
+  getParticipantsByRace,
   getRace,
   getTimestampsByRace,
   getUnassignedTimestamps,
@@ -14,6 +15,7 @@ import {
   recordTimestamp as dbRecordTimestamp,
   setRaceStartTime,
   type Finish,
+  type Participant,
   type Race,
   type Timestamp,
 } from './db';
@@ -31,6 +33,7 @@ interface RaceStore {
   timestamps: Timestamp[];  // all timestamps, ordered by sequence_num
   unassigned: Timestamp[];  // timestamps with no finish record yet
   finishes: Finish[];       // completed finish records, ordered by gun_time
+  participants: Participant[]; // full roster, for bib -> name lookups
 
   // ── Actions ─────────────────────────────────────────────────────────────────
 
@@ -84,6 +87,7 @@ export const useRaceStore = create<RaceStore>((set, get) => ({
   timestamps: [],
   unassigned: [],
   finishes: [],
+  participants: [],
 
   initDeviceId: async () => {
     const deviceId = await resolveDeviceId();
@@ -91,17 +95,18 @@ export const useRaceStore = create<RaceStore>((set, get) => ({
   },
 
   loadRace: async (db, raceId) => {
-    const [race, timestamps, unassigned, finishes] = await Promise.all([
+    const [race, timestamps, unassigned, finishes, participants] = await Promise.all([
       getRace(db, raceId),
       getTimestampsByRace(db, raceId),
       getUnassignedTimestamps(db, raceId),
       getFinishesByRace(db, raceId),
+      getParticipantsByRace(db, raceId),
     ]);
-    set({ activeRace: race, timestamps, unassigned, finishes });
+    set({ activeRace: race, timestamps, unassigned, finishes, participants });
   },
 
   clearActiveRace: () => {
-    set({ activeRace: null, timestamps: [], unassigned: [], finishes: [] });
+    set({ activeRace: null, timestamps: [], unassigned: [], finishes: [], participants: [] });
   },
 
   startRace: async (db) => {
@@ -151,11 +156,12 @@ export const useRaceStore = create<RaceStore>((set, get) => ({
   refreshData: async (db) => {
     const { activeRace } = get();
     if (!activeRace) return;
-    const [timestamps, unassigned, finishes] = await Promise.all([
+    const [timestamps, unassigned, finishes, participants] = await Promise.all([
       getTimestampsByRace(db, activeRace.id),
       getUnassignedTimestamps(db, activeRace.id),
       getFinishesByRace(db, activeRace.id),
+      getParticipantsByRace(db, activeRace.id),
     ]);
-    set({ timestamps, unassigned, finishes });
+    set({ timestamps, unassigned, finishes, participants });
   },
 }));

@@ -133,9 +133,13 @@ export default function ReviewScreen() {
       <FlatList
         style={styles.list}
         data={listData}
-        keyExtractor={(item, i) =>
-          item.kind === 'gap-header' ? 'gap-header' : item.row.timestamp_id
-        }
+        keyExtractor={(item) => {
+          if (item.kind === 'gap-header') return 'gap-header';
+          // A "finish" row's timestamp_id is null for a direct-entry bib (no
+          // Timer device), so key on finish_id there; a "gap" row is always
+          // an unmatched timestamp and so always has a timestamp_id.
+          return item.kind === 'finish' ? item.row.finish_id! : item.row.timestamp_id!;
+        }}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#fff" />}
         ListHeaderComponent={
           <View style={styles.summary}>
@@ -148,7 +152,7 @@ export default function ReviewScreen() {
           </View>
         }
         ListEmptyComponent={
-          <Text style={styles.empty}>No timestamps recorded yet.</Text>
+          <Text style={styles.empty}>No results recorded yet.</Text>
         }
         renderItem={({ item }) => {
           if (item.kind === 'gap-header') {
@@ -156,8 +160,9 @@ export default function ReviewScreen() {
           }
 
           if (item.kind === 'gap') {
+            // Gap rows are always unmatched timestamps, so these are never null.
             const elapsed = race?.start_time
-              ? item.row.recorded_at - race.start_time
+              ? item.row.recorded_at! - race.start_time
               : null;
             return (
               <View style={[styles.row, styles.rowGap]}>

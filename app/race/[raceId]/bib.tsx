@@ -2,10 +2,11 @@ import * as Haptics from 'expo-haptics';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { Stack, useLocalSearchParams } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 import { Numpad } from '@/components/numpad';
+import { participantDisplayName } from '@/lib/db';
 import { useRaceStore } from '@/lib/store';
 
 // Fallback used before race data is loaded
@@ -39,6 +40,7 @@ export default function BibScreen() {
   const activeRace = useRaceStore((s) => s.activeRace);
   const unassigned = useRaceStore((s) => s.unassigned);
   const finishes = useRaceStore((s) => s.finishes);
+  const participants = useRaceStore((s) => s.participants);
   const loadRace = useRaceStore((s) => s.loadRace);
   const clearActiveRace = useRaceStore((s) => s.clearActiveRace);
   const startRace = useRaceStore((s) => s.startRace);
@@ -111,6 +113,11 @@ export default function BibScreen() {
   // Last 3 assigned bibs, most recent first
   const recentFinishes = finishes.slice(-3).reverse();
 
+  const participantByBib = useMemo(
+    () => new Map(participants.map((p) => [p.bib_number, p])),
+    [participants],
+  );
+
   const isStale = current ? now - current.recorded_at > STALE_MS : false;
 
   const gunTime =
@@ -178,10 +185,16 @@ export default function BibScreen() {
             <View style={styles.recent}>
               {recentFinishes.map((f) => {
                 const pos = finishes.indexOf(f) + 1;
+                const participant = participantByBib.get(f.bib_number);
                 return (
                   <View key={f.id} style={styles.recentRow}>
                     <Text style={styles.recentPos}>{pos}</Text>
-                    <Text style={styles.recentBib}>#{f.bib_number}</Text>
+                    <View style={styles.recentInfo}>
+                      <Text style={styles.recentBib}>#{f.bib_number}</Text>
+                      <Text style={participant ? styles.recentName : styles.recentNameUnknown}>
+                        {participant ? participantDisplayName(participant) : 'Unregistered bib'}
+                      </Text>
+                    </View>
                     <Text style={styles.recentTime}>{formatGunTime(f.gun_time ?? 0)}</Text>
                   </View>
                 );
@@ -340,12 +353,23 @@ const styles = StyleSheet.create({
     width: 28,
     textAlign: 'right',
   },
+  recentInfo: {
+    flex: 1,
+    gap: 1,
+  },
   recentBib: {
     color: '#fff',
     fontFamily: mono,
     fontSize: 15,
     fontWeight: '600',
-    flex: 1,
+  },
+  recentName: {
+    color: '#777',
+    fontSize: 12,
+  },
+  recentNameUnknown: {
+    color: '#f59e0b',
+    fontSize: 12,
   },
   recentTime: {
     color: '#555',

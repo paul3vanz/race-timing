@@ -33,6 +33,7 @@ import {
   deleteParticipantsByRace,
   getParticipantsByRace,
   getRace,
+  participantDisplayName as displayName,
   setRaceMaxBib,
   type Participant,
   type Race,
@@ -50,11 +51,6 @@ const FIELD_ORDER: ParticipantField[] = [
   'gender',
   'dob',
 ];
-
-// Team entries share one bib_number/team_name row instead of first/last name.
-function displayName(p: { first_name: string | null; last_name: string | null; team_name: string | null }): string {
-  return p.team_name ?? ([p.first_name, p.last_name].filter(Boolean).join(' ') || '—');
-}
 
 const CSV_MIME_TYPES = [
   'text/csv',
