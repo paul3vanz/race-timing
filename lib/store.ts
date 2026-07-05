@@ -19,6 +19,7 @@ import {
   type Race,
   type Timestamp,
 } from './db';
+import { startRaceRemote } from './sync';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -46,8 +47,15 @@ interface RaceStore {
   // Unload race data when leaving the race context
   clearActiveRace: () => void;
 
-  // Set race start_time to now if not already started
+  // Set race start_time to now if not already started. Propagates to other
+  // devices via a race-safe conditional update; if another device already
+  // won that race, adopts their start_time instead.
   startRace: (db: SQLiteDatabase) => Promise<void>;
+
+  // Adopts a start_time discovered via the pre-race poll (hooks/use-race-start-poll)
+  // when another device started the race first. No-op once this device
+  // already has one — a stale poll response must never undo a local start.
+  adoptRemoteStartTime: (db: SQLiteDatabase, startTime: number) => Promise<void>;
 
   // Hot path: capture Date.now() immediately, write async, update store
   recordTimestamp: (db: SQLiteDatabase) => Promise<Timestamp | null>;
@@ -114,7 +122,35 @@ export const useRaceStore = create<RaceStore>((set, get) => ({
     if (!activeRace || activeRace.start_time !== null) return;
     const startTime = Date.now();
     await setRaceStartTime(db, activeRace.id, startTime);
-    set({ activeRace: { ...activeRace, start_time: startTime } });
+    set((state) =>
+      state.activeRace?.id === activeRace.id ? { activeRace: { ...state.activeRace, start_time: startTime } } : {},
+    );
+
+    try {
+      const winningStartTime = await startRaceRemote(db, activeRace.id, startTime);
+      if (winningStartTime !== startTime) {
+        // Another device won the race to start it first — adopt their time
+        // so every device computes gun_time off the same origin.
+        await setRaceStartTime(db, activeRace.id, winningStartTime);
+        set((state) =>
+          state.activeRace?.id === activeRace.id
+            ? { activeRace: { ...state.activeRace, start_time: winningStartTime } }
+            : {},
+        );
+      }
+    } catch {
+      // Offline or a transient error — the regular sync cycle reconciles
+      // start_time once connectivity returns; the operator isn't blocked.
+    }
+  },
+
+  adoptRemoteStartTime: async (db, startTime) => {
+    const { activeRace } = get();
+    if (!activeRace || activeRace.start_time !== null) return;
+    await setRaceStartTime(db, activeRace.id, startTime);
+    set((state) =>
+      state.activeRace?.id === activeRace.id ? { activeRace: { ...state.activeRace, start_time: startTime } } : {},
+    );
   },
 
   recordTimestamp: async (db) => {
@@ -133,19 +169,19 @@ export const useRaceStore = create<RaceStore>((set, get) => ({
 
   assignBib: async (db, bibNumber) => {
     const capturedAt = Date.now();
-    const { activeRace, unassigned } = get();
-    if (!activeRace?.start_time) return null;
+    const { activeRace, unassigned, deviceId } = get();
+    if (!activeRace?.start_time || !deviceId) return null;
 
     let finish: Finish;
     if (unassigned.length > 0) {
       const next = unassigned[0];
-      finish = await assignBibToTimestamp(db, activeRace.id, bibNumber, next, activeRace.start_time);
+      finish = await assignBibToTimestamp(db, activeRace.id, bibNumber, next, activeRace.start_time, deviceId);
       set((state) => ({
         unassigned: state.unassigned.slice(1),
         finishes: [...state.finishes, finish].sort((a, b) => (a.gun_time ?? 0) - (b.gun_time ?? 0)),
       }));
     } else {
-      finish = await recordDirectFinish(db, activeRace.id, bibNumber, capturedAt - activeRace.start_time);
+      finish = await recordDirectFinish(db, activeRace.id, bibNumber, capturedAt - activeRace.start_time, deviceId);
       set((state) => ({
         finishes: [...state.finishes, finish].sort((a, b) => (a.gun_time ?? 0) - (b.gun_time ?? 0)),
       }));

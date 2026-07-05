@@ -2,10 +2,12 @@ import { useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useEffect, useState } from 'react';
 import {
+  Alert,
   FlatList,
   KeyboardAvoidingView,
   Platform,
   Pressable,
+  Share,
   StyleSheet,
   Text,
   TextInput,
@@ -21,6 +23,8 @@ import {
   type Event,
   type Race,
 } from '@/lib/db';
+import { isSupabaseConfigured } from '@/lib/supabase';
+import { lookupEventByJoinCode, pullRace } from '@/lib/sync';
 
 interface RaceRow {
   race: Race;
@@ -49,6 +53,9 @@ export default function HomeScreen() {
   const [newName, setNewName] = useState('');
   const [newMaxBib, setNewMaxBib] = useState('999');
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
+  const [joining, setJoining] = useState(false);
+  const [joinCode, setJoinCode] = useState('');
+  const [joinBusy, setJoinBusy] = useState(false);
 
   const load = async () => {
     const events = await getEvents(db);
@@ -79,6 +86,34 @@ export default function HomeScreen() {
     setConfirmingDeleteId(null);
     await deleteRace(db, raceId);
     await load();
+  };
+
+  const handleJoin = async () => {
+    const code = joinCode.trim();
+    if (!code) return;
+    setJoinBusy(true);
+    try {
+      const match = await lookupEventByJoinCode(code);
+      if (!match) {
+        Alert.alert('Not found', `No race found for code "${code.toUpperCase()}".`);
+        return;
+      }
+      await pullRace(db, match.eventId, match.raceId);
+      setJoining(false);
+      setJoinCode('');
+      await load();
+    } catch (e) {
+      Alert.alert('Join failed', e instanceof Error ? e.message : String(e));
+    } finally {
+      setJoinBusy(false);
+    }
+  };
+
+  const handleShareCode = (race: Race, event: Event) => {
+    if (!event.join_code) return;
+    Share.share({
+      message: `Join "${race.name}" on Race Timing — code ${event.join_code}`,
+    });
   };
 
   return (
@@ -114,6 +149,11 @@ export default function HomeScreen() {
                 <Text style={styles.raceMeta}>
                   {formatDate(item.event.date)} · {raceStatus(item.race)}
                 </Text>
+                {item.event.join_code && (
+                  <Pressable onPress={() => handleShareCode(item.race, item.event)} hitSlop={6}>
+                    <Text style={styles.joinCode}>Code: {item.event.join_code} · share</Text>
+                  </Pressable>
+                )}
               </View>
               <View style={[styles.cardActions, styles.cardActionsWrap]}>
                 <Pressable
@@ -153,7 +193,7 @@ export default function HomeScreen() {
         }
       />
 
-      {/* New race form / button */}
+      {/* New race form / join-by-code form / buttons */}
       <View style={styles.footer}>
         {creating ? (
           <View style={styles.createForm}>
@@ -189,10 +229,47 @@ export default function HomeScreen() {
               </Pressable>
             </View>
           </View>
+        ) : joining ? (
+          <View style={styles.createForm}>
+            <TextInput
+              style={[styles.input, styles.joinInput]}
+              placeholder="6-character code"
+              placeholderTextColor="#555"
+              value={joinCode}
+              onChangeText={(v) => setJoinCode(v.toUpperCase())}
+              autoCapitalize="characters"
+              autoFocus
+              autoCorrect={false}
+              maxLength={6}
+              returnKeyType="done"
+              onSubmitEditing={handleJoin}
+            />
+            <View style={styles.createActions}>
+              <Pressable style={styles.btnCancel} onPress={() => { setJoining(false); setJoinCode(''); }}>
+                <Text style={styles.btnCancelText}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.btnCreate, (!joinCode.trim() || joinBusy) && styles.btnCreateDisabled]}
+                onPress={handleJoin}
+                disabled={!joinCode.trim() || joinBusy}
+              >
+                <Text style={styles.btnCreateText}>{joinBusy ? 'Joining…' : 'Join'}</Text>
+              </Pressable>
+            </View>
+          </View>
         ) : (
-          <Pressable style={styles.newBtn} onPress={() => setCreating(true)}>
-            <Text style={styles.newBtnText}>+ New Race</Text>
-          </Pressable>
+          <View style={styles.footerButtons}>
+            <Pressable style={[styles.newBtn, styles.newBtnHalf]} onPress={() => setCreating(true)}>
+              <Text style={styles.newBtnText}>+ New Race</Text>
+            </Pressable>
+            <Pressable
+              style={[styles.newBtn, styles.newBtnHalf, styles.joinBtn, !isSupabaseConfigured && styles.btnCreateDisabled]}
+              onPress={() => setJoining(true)}
+              disabled={!isSupabaseConfigured}
+            >
+              <Text style={styles.newBtnText}>Join Race</Text>
+            </Pressable>
+          </View>
         )}
       </View>
     </KeyboardAvoidingView>
@@ -239,6 +316,12 @@ const styles = StyleSheet.create({
   raceMeta: {
     color: '#555',
     fontSize: 13,
+  },
+  joinCode: {
+    color: '#4caf50',
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 2,
   },
   cardActions: {
     flexDirection: 'row',
@@ -306,16 +389,32 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: '#1a1a1a',
   },
+  footerButtons: {
+    flexDirection: 'row',
+    gap: 10,
+  },
   newBtn: {
     backgroundColor: '#1e1e1e',
     borderRadius: 14,
     padding: 18,
     alignItems: 'center',
   },
+  newBtnHalf: {
+    flex: 1,
+  },
+  joinBtn: {
+    backgroundColor: '#1a237e',
+  },
   newBtnText: {
     color: '#fff',
     fontSize: 17,
     fontWeight: '600',
+  },
+  joinInput: {
+    textAlign: 'center',
+    letterSpacing: 4,
+    fontSize: 22,
+    fontWeight: '700',
   },
   createForm: {
     gap: 12,

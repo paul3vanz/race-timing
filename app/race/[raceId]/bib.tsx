@@ -6,8 +6,10 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 import { Numpad } from '@/components/numpad';
+import { useRaceStartPoll } from '@/hooks/use-race-start-poll';
 import { participantDisplayName } from '@/lib/db';
 import { useRaceStore } from '@/lib/store';
+import { pullRaceData } from '@/lib/sync';
 
 // Fallback used before race data is loaded
 const DEFAULT_BIB_DIGITS = 3;
@@ -45,6 +47,9 @@ export default function BibScreen() {
   const clearActiveRace = useRaceStore((s) => s.clearActiveRace);
   const startRace = useRaceStore((s) => s.startRace);
   const assignBib = useRaceStore((s) => s.assignBib);
+  const refreshData = useRaceStore((s) => s.refreshData);
+
+  useRaceStartPoll(raceId);
 
   const [bib, setBib] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -55,7 +60,14 @@ export default function BibScreen() {
   const clockRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
-    if (raceId) loadRace(db, raceId);
+    if (raceId) {
+      loadRace(db, raceId);
+      // One-shot pull so a standalone Bib device can see a separate Timer
+      // device's taps in its own queue, not just its own local writes.
+      pullRaceData(db, raceId)
+        .then(() => refreshData(db))
+        .catch(() => {});
+    }
     activateKeepAwakeAsync();
     tickRef.current = setInterval(() => setTick((t) => t + 1), 30_000);
     return () => {

@@ -5,7 +5,9 @@ import { useSQLiteContext } from 'expo-sqlite';
 import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 
+import { useRaceStartPoll } from '@/hooks/use-race-start-poll';
 import { useRaceStore } from '@/lib/store';
+import { pullRaceData } from '@/lib/sync';
 
 // ── Formatting ────────────────────────────────────────────────────────────────
 
@@ -36,6 +38,9 @@ export default function TimerScreen() {
   const clearActiveRace = useRaceStore((s) => s.clearActiveRace);
   const startRace = useRaceStore((s) => s.startRace);
   const recordTimestamp = useRaceStore((s) => s.recordTimestamp);
+  const refreshData = useRaceStore((s) => s.refreshData);
+
+  useRaceStartPoll(raceId);
 
   const [elapsed, setElapsed] = useState(0);
   const [flash, setFlash] = useState(false);
@@ -43,7 +48,15 @@ export default function TimerScreen() {
 
   // Load race data + keep screen on for the lifetime of this screen
   useEffect(() => {
-    if (raceId) loadRace(db, raceId);
+    if (raceId) {
+      loadRace(db, raceId);
+      // One-shot pull so this device sees other devices' taps/entries too —
+      // not a recurring poll, see hooks/use-race-start-poll.ts for the one
+      // field (start_time) that needs faster propagation.
+      pullRaceData(db, raceId)
+        .then(() => refreshData(db))
+        .catch(() => {});
+    }
     activateKeepAwakeAsync();
     return () => {
       clearActiveRace();
