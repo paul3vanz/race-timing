@@ -577,6 +577,7 @@ export interface ReviewRow {
   finish_id: string | null;
   bib_number: string | null;
   gun_time: number | null;
+  flagged: 0 | 1 | null; // low-confidence reconciled match, still worth a second look
 }
 
 export async function getReviewRows(
@@ -600,7 +601,8 @@ export async function getReviewRows(
          t.recorded_at,
          f.id         AS finish_id,
          f.bib_number,
-         f.gun_time
+         f.gun_time,
+         f.flagged
        FROM timestamps t
        LEFT JOIN finishes f ON f.timestamp_id = t.id
        WHERE t.race_id = ? AND t.voided = 0 AND t.duplicate_of IS NULL
@@ -613,7 +615,8 @@ export async function getReviewRows(
          NULL AS recorded_at,
          f.id AS finish_id,
          f.bib_number,
-         f.gun_time
+         f.gun_time,
+         f.flagged
        FROM finishes f
        WHERE f.race_id = ? AND f.timestamp_id IS NULL AND f.duplicate_of IS NULL
      )

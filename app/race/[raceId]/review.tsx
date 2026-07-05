@@ -3,9 +3,9 @@ import { Stack, useLocalSearchParams } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useCallback, useEffect, useState } from 'react';
-import { Alert, FlatList, Platform, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
+import { Alert, FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
 
-import { DeviceActivityStrip, DisagreementRow, FlaggedPairRow, UnmatchedBibRow, UnmatchedTapRow } from '@/components/reconcile-row';
+import { DeviceActivityStrip, SpreadsheetRow, type SpreadsheetRowData } from '@/components/reconcile-row';
 import {
   assignBibToTimestamp,
   getDeviceActivity,
@@ -54,16 +54,16 @@ function p2(n: number) {
 
 // ── CSV ───────────────────────────────────────────────────────────────────────
 
-function buildCsv(matched: ReviewRow[]): string {
+function buildCsv(confirmed: ReviewRow[]): string {
   const lines = ['Position,Bib,Gun Time'];
-  matched.forEach((row, i) => {
+  confirmed.forEach((row, i) => {
     lines.push(`${i + 1},${row.bib_number},${formatGunTime(row.gun_time ?? 0)}`);
   });
   return lines.join('\n');
 }
 
-async function exportCsv(raceName: string, matched: ReviewRow[]) {
-  const csv = buildCsv(matched);
+async function exportCsv(raceName: string, confirmed: ReviewRow[]) {
+  const csv = buildCsv(confirmed);
   const slug = raceName.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
   const file = new File(Paths.document, `${slug}-results.csv`);
   file.write(csv);
@@ -137,6 +137,88 @@ async function buildProposal(
   };
 }
 
+// ── Spreadsheet row model ─────────────────────────────────────────────────────
+//
+// One continuous, time-ordered list instead of a "results" list with a
+// separate "problems" list underneath — a confirmed match, a pending
+// proposal, a disagreement, and a gap on either side all read as rows in the
+// same sequence, so a blank cell or a dashed row is visible right where it
+// happened rather than being sorted away into its own section.
+
+interface PositionedRow {
+  key: string;
+  position: number | null; // only rows with a bib identity get a running position
+  data: SpreadsheetRowData;
+}
+
+function buildSpreadsheetRows(rows: ReviewRow[], proposal: Proposal, raceStartTime: number | null): PositionedRow[] {
+  const startTime = raceStartTime ?? 0;
+  const disagreementBibIds = new Set(proposal.disagreements.map((d) => d.sourceIds[0]));
+
+  const unpositioned: { key: string; time: number; hasBib: boolean; data: SpreadsheetRowData }[] = [];
+
+  for (const row of rows) {
+    if (row.finish_id === null) continue; // pure gap — represented via unmatchedTaps below
+    unpositioned.push({
+      key: row.finish_id,
+      time: row.gun_time ?? 0,
+      hasBib: true,
+      data: { kind: 'linked', time: row.gun_time ?? 0, finishId: row.finish_id, bibNumber: row.bib_number ?? '', flagged: row.flagged === 1 },
+    });
+  }
+
+  for (const pair of proposal.pairs) {
+    if (disagreementBibIds.has(pair.bib.sourceIds[0])) continue; // shown via the disagreement row instead
+    const tapTime = pair.tap.time - startTime;
+    const bibTime = pair.bib.time - startTime;
+    unpositioned.push({
+      key: `pair-${pair.bib.sourceIds[0]}`,
+      time: tapTime,
+      hasBib: true,
+      data: { kind: 'proposed', time: tapTime, tapTime, bibTime, flagged: pair.flagged, pair },
+    });
+  }
+
+  for (const entry of proposal.disagreements) {
+    const pair = proposal.pairs.find((p) => p.bib.sourceIds[0] === entry.sourceIds[0]) ?? null;
+    const tapTime = pair ? pair.tap.time - startTime : null;
+    unpositioned.push({
+      key: `disagreement-${entry.sourceIds[0]}`,
+      time: tapTime ?? entry.time - startTime,
+      hasBib: true,
+      data: { kind: 'disagreement', time: tapTime ?? entry.time - startTime, tapTime, entry, pair },
+    });
+  }
+
+  for (const tap of proposal.unmatchedTaps) {
+    unpositioned.push({
+      key: `tap-${tap.sourceIds[0]}`,
+      time: tap.time - startTime,
+      hasBib: false,
+      data: { kind: 'gap-tap', time: tap.time - startTime, tap },
+    });
+  }
+
+  for (const bib of proposal.unmatchedBibs) {
+    const bibTime = bib.time - startTime;
+    unpositioned.push({
+      key: `bib-${bib.sourceIds[0]}`,
+      time: bibTime,
+      hasBib: true,
+      data: { kind: 'gap-bib', time: bibTime, bibTime, bib },
+    });
+  }
+
+  unpositioned.sort((a, b) => a.time - b.time);
+
+  let pos = 0;
+  return unpositioned.map((row) => {
+    if (!row.hasBib) return { key: row.key, position: null, data: row.data };
+    pos += 1;
+    return { key: row.key, position: pos, data: row.data };
+  });
+}
+
 // ── Screen ────────────────────────────────────────────────────────────────────
 
 export default function ReviewScreen() {
@@ -178,13 +260,13 @@ export default function ReviewScreen() {
 
   // ── Derived ─────────────────────────────────────────────────────────────────
 
-  const matched = [...rows.filter((r) => r.finish_id !== null)].sort(
-    (a, b) => (a.gun_time ?? 0) - (b.gun_time ?? 0),
-  );
-  const positionMap = new Map(matched.map((r, i) => [r.finish_id, i + 1]));
-
+  const confirmedRows = rows.filter((r) => r.finish_id !== null).sort((a, b) => (a.gun_time ?? 0) - (b.gun_time ?? 0));
+  const spreadsheetRows = buildSpreadsheetRows(rows, proposal, race?.start_time ?? null);
   const confidentPairs = proposal.pairs.filter((p) => !p.flagged);
-  const flaggedPairs = proposal.pairs.filter((p) => p.flagged);
+  const finisherCount = spreadsheetRows.filter((r) => r.position !== null).length;
+  const needsReviewCount = spreadsheetRows.filter(
+    (r) => r.data.kind !== 'linked' || r.data.flagged,
+  ).length;
 
   // ── Commit actions ────────────────────────────────────────────────────────
 
@@ -253,42 +335,16 @@ export default function ReviewScreen() {
   };
 
   const handleExport = async () => {
-    if (matched.length === 0) {
+    if (confirmedRows.length === 0) {
       Alert.alert('Nothing to export', 'Assign some bibs first.');
       return;
     }
     try {
-      await exportCsv(race?.name ?? 'race', matched);
+      await exportCsv(race?.name ?? 'race', confirmedRows);
     } catch (e) {
       Alert.alert('Export failed', String(e));
     }
   };
-
-  // ── Render helpers ───────────────────────────────────────────────────────────
-
-  type ListItem =
-    | { kind: 'finish'; row: ReviewRow }
-    | { kind: 'needs-review-header' }
-    | { kind: 'confirm-all' }
-    | { kind: 'disagreement'; entry: CanonicalBibEntry }
-    | { kind: 'flagged-pair'; pair: ReconciledPair }
-    | { kind: 'unmatched-tap'; tap: CanonicalTap }
-    | { kind: 'unmatched-bib'; bib: CanonicalBibEntry }
-    | { kind: 'diagnostics' };
-
-  const needsReviewCount =
-    proposal.disagreements.length + flaggedPairs.length + proposal.unmatchedTaps.length + proposal.unmatchedBibs.length;
-
-  const listData: ListItem[] = [
-    ...matched.map((row) => ({ kind: 'finish' as const, row })),
-    ...(needsReviewCount > 0 || confidentPairs.length > 0 ? [{ kind: 'needs-review-header' as const }] : []),
-    ...(confidentPairs.length > 0 ? [{ kind: 'confirm-all' as const }] : []),
-    ...proposal.disagreements.map((entry) => ({ kind: 'disagreement' as const, entry })),
-    ...flaggedPairs.map((pair) => ({ kind: 'flagged-pair' as const, pair })),
-    ...proposal.unmatchedTaps.map((tap) => ({ kind: 'unmatched-tap' as const, tap })),
-    ...proposal.unmatchedBibs.map((bib) => ({ kind: 'unmatched-bib' as const, bib })),
-    ...(deviceActivity.length > 0 ? [{ kind: 'diagnostics' as const }] : []),
-  ];
 
   return (
     <>
@@ -307,111 +363,52 @@ export default function ReviewScreen() {
 
       <FlatList
         style={styles.list}
-        data={listData}
-        keyExtractor={(item, i) => {
-          switch (item.kind) {
-            case 'finish': return item.row.finish_id!;
-            case 'needs-review-header': return 'needs-review-header';
-            case 'confirm-all': return 'confirm-all';
-            case 'disagreement': return `disagreement-${item.entry.sourceIds[0]}`;
-            case 'flagged-pair': return `pair-${item.pair.bib.sourceIds[0]}`;
-            case 'unmatched-tap': return `tap-${item.tap.sourceIds[0]}`;
-            case 'unmatched-bib': return `bib-${item.bib.sourceIds[0]}`;
-            case 'diagnostics': return 'diagnostics';
-            default: return String(i);
-          }
-        }}
+        data={spreadsheetRows}
+        keyExtractor={(item) => item.key}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#fff" />}
         ListHeaderComponent={
-          <View style={styles.summary}>
-            <Text style={styles.summaryText}>
-              {matched.length} {matched.length === 1 ? 'finisher' : 'finishers'}
-            </Text>
-            {needsReviewCount > 0 && (
-              <Text style={styles.summaryGaps}>{needsReviewCount} need review</Text>
+          <View>
+            <View style={styles.summary}>
+              <Text style={styles.summaryText}>
+                {finisherCount} {finisherCount === 1 ? 'finisher' : 'finishers'}
+              </Text>
+              {needsReviewCount > 0 && (
+                <Text style={styles.summaryGaps}>{needsReviewCount} need review</Text>
+              )}
+            </View>
+            {confidentPairs.length > 0 && (
+              <Pressable style={styles.confirmAllBtn} onPress={handleConfirmAllConfident}>
+                <Text style={styles.confirmAllBtnText}>
+                  Confirm all {confidentPairs.length} confident match{confidentPairs.length === 1 ? '' : 'es'}
+                </Text>
+              </Pressable>
             )}
           </View>
         }
+        ListFooterComponent={<DeviceActivityStrip activity={deviceActivity} />}
         ListEmptyComponent={
           <Text style={styles.empty}>No results recorded yet.</Text>
         }
-        renderItem={({ item }) => {
-          switch (item.kind) {
-            case 'needs-review-header':
-              return <Text style={styles.sectionHeader}>Needs review</Text>;
-
-            case 'confirm-all':
-              return (
-                <Pressable style={styles.confirmAllBtn} onPress={handleConfirmAllConfident}>
-                  <Text style={styles.confirmAllBtnText}>
-                    Confirm all {confidentPairs.length} confident match{confidentPairs.length === 1 ? '' : 'es'}
-                  </Text>
-                </Pressable>
-              );
-
-            case 'disagreement':
-              return (
-                <DisagreementRow
-                  entry={item.entry}
-                  raceStartTime={race?.start_time ?? null}
-                  onResolve={(bibNumber) => handleResolveDisagreement(item.entry, bibNumber)}
-                />
-              );
-
-            case 'flagged-pair':
-              return (
-                <FlaggedPairRow
-                  pair={item.pair}
-                  raceStartTime={race?.start_time ?? null}
-                  onConfirm={() => handleConfirmPair(item.pair)}
-                  onUnlink={load}
-                />
-              );
-
-            case 'unmatched-tap':
-              return (
-                <UnmatchedTapRow
-                  tap={item.tap}
-                  raceStartTime={race?.start_time ?? null}
-                  onAssignBib={(bibNumber) => handleAssignBibToTap(item.tap, bibNumber)}
-                  onDiscard={() => handleDiscardTap(item.tap)}
-                />
-              );
-
-            case 'unmatched-bib':
-              return (
-                <UnmatchedBibRow
-                  bib={item.bib}
-                  raceStartTime={race?.start_time ?? null}
-                  nearbyTaps={proposal.unmatchedTaps}
-                  onInsertTap={() => handleInsertTapForBib(item.bib)}
-                  onMatchTap={(tap) => handleMatchBibToTap(item.bib, tap)}
-                />
-              );
-
-            case 'diagnostics':
-              return <DeviceActivityStrip activity={deviceActivity} />;
-
-            case 'finish': {
-              const pos = positionMap.get(item.row.finish_id!);
-              return (
-                <View style={styles.row}>
-                  <Text style={styles.pos}>{pos}</Text>
-                  <Text style={styles.bib}>{item.row.bib_number}</Text>
-                  <Text style={styles.time}>{formatGunTime(item.row.gun_time ?? 0)}</Text>
-                </View>
-              );
-            }
-          }
-        }}
+        renderItem={({ item }) => (
+          <SpreadsheetRow
+            position={item.position}
+            data={item.data}
+            nearbyTaps={proposal.unmatchedTaps}
+            onConfirmPair={handleConfirmPair}
+            onUnlinkPair={load}
+            onAssignBibToTap={handleAssignBibToTap}
+            onDiscardTap={handleDiscardTap}
+            onInsertTapForBib={handleInsertTapForBib}
+            onMatchBibToTap={handleMatchBibToTap}
+            onResolveDisagreement={handleResolveDisagreement}
+          />
+        )}
       />
     </>
   );
 }
 
 // ── Styles ────────────────────────────────────────────────────────────────────
-
-const mono = Platform.select({ ios: 'ui-monospace', default: 'monospace' });
 
 const styles = StyleSheet.create({
   list: {
@@ -437,16 +434,6 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '600',
   },
-  sectionHeader: {
-    color: '#555',
-    fontSize: 12,
-    fontWeight: '600',
-    textTransform: 'uppercase',
-    letterSpacing: 0.8,
-    paddingHorizontal: 16,
-    paddingTop: 20,
-    paddingBottom: 8,
-  },
   confirmAllBtn: {
     marginHorizontal: 16,
     marginBottom: 8,
@@ -459,35 +446,6 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 14,
     fontWeight: '700',
-  },
-  row: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#141414',
-    gap: 16,
-  },
-  pos: {
-    color: '#4caf50',
-    fontFamily: mono,
-    fontSize: 15,
-    fontWeight: '700',
-    width: 32,
-    textAlign: 'right',
-  },
-  bib: {
-    color: '#fff',
-    fontFamily: mono,
-    fontSize: 17,
-    fontWeight: '600',
-    flex: 1,
-  },
-  time: {
-    color: '#888',
-    fontFamily: mono,
-    fontSize: 15,
   },
   empty: {
     color: '#444',
