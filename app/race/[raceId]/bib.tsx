@@ -3,7 +3,7 @@ import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { Stack, useLocalSearchParams } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useEffect, useRef, useState } from 'react';
-import { Platform, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 import { Numpad } from '@/components/numpad';
 import { useRaceStore } from '@/lib/store';
@@ -128,58 +128,67 @@ export default function BibScreen() {
       <Stack.Screen options={{ title: activeRace?.name ?? 'Bib Entry', headerShown: true }} />
       <View style={styles.container}>
 
-        {/* ── Timestamp card ── */}
-        <View style={[styles.card, isStale && styles.cardStale]}>
-          {!activeRace?.start_time ? (
-            <View style={styles.notStarted}>
-              <Text style={styles.waiting}>Race not started</Text>
-              <Pressable style={styles.startBtn} onPress={() => startRace(db)}>
-                <Text style={styles.startBtnText}>Start Race</Text>
-              </Pressable>
-            </View>
-          ) : current ? (
-            <>
-              <Text style={[styles.seq, isStale && styles.textStale]}>
-                Finisher #{current.sequence_num}
-              </Text>
-              <Text style={[styles.gunTime, isStale && styles.textStale]}>
-                {gunTime}
-              </Text>
-              {queueDepth > 1 && (
-                <Text style={styles.queue}>
-                  {queueDepth - 1} more waiting
+        {/* Scrolls/shrinks under pressure instead of pushing the numpad below
+            up over the bib digits — the digits and keys must always be
+            fully visible while the info above them varies in height. */}
+        <ScrollView
+          style={styles.infoScroll}
+          contentContainerStyle={styles.infoScrollContent}
+          showsVerticalScrollIndicator={false}
+        >
+          {/* ── Timestamp card ── */}
+          <View style={[styles.card, isStale && styles.cardStale]}>
+            {!activeRace?.start_time ? (
+              <View style={styles.notStarted}>
+                <Text style={styles.waiting}>Race not started</Text>
+                <Pressable style={styles.startBtn} onPress={() => startRace(db)}>
+                  <Text style={styles.startBtnText}>Start Race</Text>
+                </Pressable>
+              </View>
+            ) : current ? (
+              <>
+                <Text style={[styles.seq, isStale && styles.textStale]}>
+                  Finisher #{current.sequence_num}
                 </Text>
-              )}
-              {isStale && (
-                <Text style={styles.staleWarning}>
-                  No bib for {Math.floor((now - current.recorded_at) / 60_000)} min — check finish order
+                <Text style={[styles.gunTime, isStale && styles.textStale]}>
+                  {gunTime}
                 </Text>
-              )}
-            </>
-          ) : (
-            <>
-              <Text style={styles.seq}>Live entry</Text>
-              <Text style={styles.gunTime}>{formatGunTime(elapsed)}</Text>
-              <Text style={styles.queue}>Type bib as each finisher crosses</Text>
-            </>
-          )}
-        </View>
-
-        {/* ── Recent entries ── */}
-        {recentFinishes.length > 0 && (
-          <View style={styles.recent}>
-            {recentFinishes.map((f) => {
-              const pos = finishes.indexOf(f) + 1;
-              return (
-                <View key={f.id} style={styles.recentRow}>
-                  <Text style={styles.recentPos}>{pos}</Text>
-                  <Text style={styles.recentBib}>#{f.bib_number}</Text>
-                  <Text style={styles.recentTime}>{formatGunTime(f.gun_time ?? 0)}</Text>
-                </View>
-              );
-            })}
+                {queueDepth > 1 && (
+                  <Text style={styles.queue}>
+                    {queueDepth - 1} more waiting
+                  </Text>
+                )}
+                {isStale && (
+                  <Text style={styles.staleWarning}>
+                    No bib for {Math.floor((now - current.recorded_at) / 60_000)} min — check finish order
+                  </Text>
+                )}
+              </>
+            ) : (
+              <>
+                <Text style={styles.seq}>Live entry</Text>
+                <Text style={styles.gunTime}>{formatGunTime(elapsed)}</Text>
+                <Text style={styles.queue}>Type bib as each finisher crosses</Text>
+              </>
+            )}
           </View>
-        )}
+
+          {/* ── Recent entries ── */}
+          {recentFinishes.length > 0 && (
+            <View style={styles.recent}>
+              {recentFinishes.map((f) => {
+                const pos = finishes.indexOf(f) + 1;
+                return (
+                  <View key={f.id} style={styles.recentRow}>
+                    <Text style={styles.recentPos}>{pos}</Text>
+                    <Text style={styles.recentBib}>#{f.bib_number}</Text>
+                    <Text style={styles.recentTime}>{formatGunTime(f.gun_time ?? 0)}</Text>
+                  </View>
+                );
+              })}
+            </View>
+          )}
+        </ScrollView>
 
         {/* ── Bib digit display ── */}
         <View style={styles.bibRow}>
@@ -194,15 +203,13 @@ export default function BibScreen() {
         </View>
 
         {/* ── Numpad ── */}
-        <View style={styles.padWrap}>
-          <Numpad
-            onDigit={handleDigit}
-            onDelete={handleDelete}
-            onConfirm={handleConfirm}
-            canConfirm={bib.length > 0}
-            disabled={waiting || submitting}
-          />
-        </View>
+        <Numpad
+          onDigit={handleDigit}
+          onDelete={handleDelete}
+          onConfirm={handleConfirm}
+          canConfirm={bib.length > 0}
+          disabled={waiting || submitting}
+        />
 
       </View>
     </>
@@ -219,6 +226,12 @@ const styles = StyleSheet.create({
     backgroundColor: '#0d0d0d',
     paddingTop: 16,
     paddingBottom: 24,
+    gap: 16,
+  },
+  infoScroll: {
+    flex: 1,
+  },
+  infoScrollContent: {
     gap: 20,
   },
   card: {
@@ -303,10 +316,6 @@ const styles = StyleSheet.create({
     fontFamily: mono,
     fontSize: 36,
     fontWeight: '700',
-  },
-  padWrap: {
-    flex: 1,
-    justifyContent: 'flex-end',
   },
   recent: {
     marginHorizontal: 16,

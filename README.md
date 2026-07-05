@@ -25,6 +25,14 @@ In the output, you'll find options to open the app in a
 
 You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
 
+## Live sync (Supabase)
+
+The app works fully offline by default. To push results to Supabase for a
+live results URL, copy `.env.example` to `.env`, fill in your Supabase URL
+and anon key, and restart `expo start`. See [supabase/README.md](supabase/README.md)
+for schema/setup details. Sync status and a manual "Sync Now" button are on
+the Settings tab.
+
 ## Get a fresh project
 
 When you're ready, run:

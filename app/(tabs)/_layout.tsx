@@ -27,7 +27,6 @@ export default function TabLayout() {
           title: 'Settings',
           tabBarLabel: 'Settings',
           tabBarIcon: ({ color }) => <IconSymbol size={26} name="gearshape.fill" color={color} />,
-          href: null, // hidden until Settings screen is built
         }}
       />
     </Tabs>

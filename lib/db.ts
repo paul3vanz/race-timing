@@ -9,6 +9,7 @@ export interface Event {
   date: string; // ISO8601
   location: string | null;
   status: 'pending' | 'active' | 'finished';
+  synced: 0 | 1;
 }
 
 export interface Race {
@@ -18,16 +19,22 @@ export interface Race {
   start_time: number | null; // Unix ms
   wave: number;
   max_bib: number; // highest expected bib number — drives auto-submit digit count
+  synced: 0 | 1;
 }
 
 export interface Participant {
   id: string;
   race_id: string;
   bib_number: string; // TEXT — leading zeros and alphanumeric bibs exist
-  name: string | null;
-  category: string | null;
+  first_name: string | null;
+  last_name: string | null;
   gender: string | null;
   dob: string | null;
+  club: string | null;
+  category: string | null;
+  team_name: string | null; // set for team entries — one row per team, sharing a bib
+  sub_category: string | null; // e.g. solo/pair/team — bibs are allocated and results grouped per value
+  synced: 0 | 1;
 }
 
 export interface Timestamp {
@@ -103,6 +110,40 @@ const MIGRATIONS: string[] = [
 
   // v2 — max_bib on races (drives auto-submit digit count on bib entry screen)
   `ALTER TABLE races ADD COLUMN max_bib INTEGER NOT NULL DEFAULT 999;`,
+
+  // v3 — synced flag on events/races/participants (timestamps/finishes already
+  // had one). Lets the Supabase sync worker push only rows that changed
+  // locally instead of re-uploading the whole race every cycle.
+  `
+  ALTER TABLE events ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE races ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE participants ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;
+  `,
+
+  // v4 — team entries. Some participants are a team sharing a single bib
+  // (one row per team, timed as one entry) rather than an individual, so
+  // every personal field has to become optional. Splits the old combined
+  // `name` into first_name/last_name and adds club + team_name. The old
+  // `name` column is dropped outright (not left orphaned) — every read here
+  // uses `SELECT *`, so a leftover column would silently ride along in every
+  // row object and get pushed to Supabase, which no longer has that column.
+  // "At least a name or a team" is enforced in application code (see
+  // upsertParticipant), not a DB constraint — SQLite can't add a multi-column
+  // CHECK to an existing table without a full rebuild.
+  `
+  ALTER TABLE participants ADD COLUMN first_name TEXT;
+  ALTER TABLE participants ADD COLUMN last_name TEXT;
+  ALTER TABLE participants ADD COLUMN club TEXT;
+  ALTER TABLE participants ADD COLUMN team_name TEXT;
+  UPDATE participants SET last_name = name WHERE name IS NOT NULL AND last_name IS NULL;
+  ALTER TABLE participants DROP COLUMN name;
+  `,
+
+  // v5 — sub-category (e.g. solo/pair/team for a multi-lap event). Bibs are
+  // allocated per sub-category block and results are grouped by it, so it
+  // needs to travel with the participant rather than being inferred from
+  // team_name (a solo entrant still has a name, not a team).
+  `ALTER TABLE participants ADD COLUMN sub_category TEXT;`,
 ];
 
 export async function migrateDbIfNeeded(db: SQLite.SQLiteDatabase): Promise<void> {
@@ -119,6 +160,14 @@ export async function migrateDbIfNeeded(db: SQLite.SQLiteDatabase): Promise<void
   // patches/AccessHandlePoolVFS.js), leaving user_version ahead of the
   // columns that actually exist. Verify rather than trust the counter.
   await ensureColumn(db, 'races', 'max_bib', 'INTEGER NOT NULL DEFAULT 999');
+  await ensureColumn(db, 'events', 'synced', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn(db, 'races', 'synced', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn(db, 'participants', 'synced', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn(db, 'participants', 'first_name', 'TEXT');
+  await ensureColumn(db, 'participants', 'last_name', 'TEXT');
+  await ensureColumn(db, 'participants', 'club', 'TEXT');
+  await ensureColumn(db, 'participants', 'team_name', 'TEXT');
+  await ensureColumn(db, 'participants', 'sub_category', 'TEXT');
 }
 
 async function ensureColumn(
@@ -151,14 +200,14 @@ export async function getEvent(db: SQLite.SQLiteDatabase, id: string): Promise<E
 
 export async function createEvent(
   db: SQLite.SQLiteDatabase,
-  data: Omit<Event, 'id'>,
+  data: Omit<Event, 'id' | 'synced'>,
 ): Promise<Event> {
   const id = uuid();
   await db.runAsync(
     'INSERT INTO events (id, name, date, location, status) VALUES (?, ?, ?, ?, ?)',
     [id, data.name, data.date, data.location ?? null, data.status],
   );
-  return { id, ...data };
+  return { id, ...data, synced: 0 };
 }
 
 export async function updateEventStatus(
@@ -166,7 +215,15 @@ export async function updateEventStatus(
   id: string,
   status: Event['status'],
 ): Promise<void> {
-  await db.runAsync('UPDATE events SET status = ? WHERE id = ?', [status, id]);
+  await db.runAsync('UPDATE events SET status = ?, synced = 0 WHERE id = ?', [status, id]);
+}
+
+export async function getUnsyncedEvents(db: SQLite.SQLiteDatabase): Promise<Event[]> {
+  return db.getAllAsync<Event>('SELECT * FROM events WHERE synced = 0');
+}
+
+export async function markEventSynced(db: SQLite.SQLiteDatabase, id: string): Promise<void> {
+  await db.runAsync('UPDATE events SET synced = 1 WHERE id = ?', [id]);
 }
 
 // ── Races ─────────────────────────────────────────────────────────────────────
@@ -187,14 +244,14 @@ export async function getRace(db: SQLite.SQLiteDatabase, id: string): Promise<Ra
 
 export async function createRace(
   db: SQLite.SQLiteDatabase,
-  data: Omit<Race, 'id'>,
+  data: Omit<Race, 'id' | 'synced'>,
 ): Promise<Race> {
   const id = uuid();
   await db.runAsync(
     'INSERT INTO races (id, event_id, name, start_time, wave, max_bib) VALUES (?, ?, ?, ?, ?, ?)',
     [id, data.event_id, data.name, data.start_time ?? null, data.wave, data.max_bib],
   );
-  return { id, ...data };
+  return { id, ...data, synced: 0 };
 }
 
 export async function setRaceStartTime(
@@ -202,7 +259,23 @@ export async function setRaceStartTime(
   raceId: string,
   startTime: number,
 ): Promise<void> {
-  await db.runAsync('UPDATE races SET start_time = ? WHERE id = ?', [startTime, raceId]);
+  await db.runAsync('UPDATE races SET start_time = ?, synced = 0 WHERE id = ?', [startTime, raceId]);
+}
+
+export async function setRaceMaxBib(
+  db: SQLite.SQLiteDatabase,
+  raceId: string,
+  maxBib: number,
+): Promise<void> {
+  await db.runAsync('UPDATE races SET max_bib = ?, synced = 0 WHERE id = ?', [maxBib, raceId]);
+}
+
+export async function getUnsyncedRaces(db: SQLite.SQLiteDatabase): Promise<Race[]> {
+  return db.getAllAsync<Race>('SELECT * FROM races WHERE synced = 0');
+}
+
+export async function markRaceSynced(db: SQLite.SQLiteDatabase, id: string): Promise<void> {
+  await db.runAsync('UPDATE races SET synced = 1 WHERE id = ?', [id]);
 }
 
 export async function deleteRace(db: SQLite.SQLiteDatabase, raceId: string): Promise<void> {
@@ -239,27 +312,97 @@ export async function getParticipantsByRace(
   );
 }
 
+// A participant is either an individual (first/last name) or a team entry
+// sharing one bib (team_name only) — one of the two identities is required.
+function hasParticipantIdentity(
+  data: Pick<Participant, 'first_name' | 'last_name' | 'team_name'>,
+): boolean {
+  return Boolean(data.first_name || data.last_name || data.team_name);
+}
+
 export async function upsertParticipant(
   db: SQLite.SQLiteDatabase,
-  data: Omit<Participant, 'id'>,
+  data: Omit<Participant, 'id' | 'synced'>,
 ): Promise<Participant> {
+  if (!hasParticipantIdentity(data)) {
+    throw new Error(`Bib ${data.bib_number} needs a first/last name or a team name.`);
+  }
+
   const existing = await db.getFirstAsync<Participant>(
     'SELECT * FROM participants WHERE race_id = ? AND bib_number = ?',
     [data.race_id, data.bib_number],
   );
   if (existing) {
     await db.runAsync(
-      'UPDATE participants SET name = ?, category = ?, gender = ?, dob = ? WHERE id = ?',
-      [data.name ?? null, data.category ?? null, data.gender ?? null, data.dob ?? null, existing.id],
+      `UPDATE participants
+       SET first_name = ?, last_name = ?, gender = ?, dob = ?, club = ?, category = ?, team_name = ?,
+           sub_category = ?, synced = 0
+       WHERE id = ?`,
+      [
+        data.first_name ?? null,
+        data.last_name ?? null,
+        data.gender ?? null,
+        data.dob ?? null,
+        data.club ?? null,
+        data.category ?? null,
+        data.team_name ?? null,
+        data.sub_category ?? null,
+        existing.id,
+      ],
     );
-    return { ...existing, ...data };
+    return { ...existing, ...data, synced: 0 };
   }
   const id = uuid();
   await db.runAsync(
-    'INSERT INTO participants (id, race_id, bib_number, name, category, gender, dob) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [id, data.race_id, data.bib_number, data.name ?? null, data.category ?? null, data.gender ?? null, data.dob ?? null],
+    `INSERT INTO participants
+       (id, race_id, bib_number, first_name, last_name, gender, dob, club, category, team_name, sub_category)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      id,
+      data.race_id,
+      data.bib_number,
+      data.first_name ?? null,
+      data.last_name ?? null,
+      data.gender ?? null,
+      data.dob ?? null,
+      data.club ?? null,
+      data.category ?? null,
+      data.team_name ?? null,
+      data.sub_category ?? null,
+    ],
   );
-  return { id, ...data };
+  return { id, ...data, synced: 0 };
+}
+
+// Bulk import from CSV — wrapped in a transaction so a few hundred rows
+// commit as one write instead of one fsync per row.
+export async function bulkUpsertParticipants(
+  db: SQLite.SQLiteDatabase,
+  rows: Omit<Participant, 'id' | 'synced'>[],
+): Promise<number> {
+  let count = 0;
+  await db.withTransactionAsync(async () => {
+    for (const row of rows) {
+      await upsertParticipant(db, row);
+      count++;
+    }
+  });
+  return count;
+}
+
+export async function deleteParticipantsByRace(
+  db: SQLite.SQLiteDatabase,
+  raceId: string,
+): Promise<void> {
+  await db.runAsync('DELETE FROM participants WHERE race_id = ?', [raceId]);
+}
+
+export async function getUnsyncedParticipants(db: SQLite.SQLiteDatabase): Promise<Participant[]> {
+  return db.getAllAsync<Participant>('SELECT * FROM participants WHERE synced = 0');
+}
+
+export async function markParticipantSynced(db: SQLite.SQLiteDatabase, id: string): Promise<void> {
+  await db.runAsync('UPDATE participants SET synced = 1 WHERE id = ?', [id]);
 }
 
 // ── Timestamps ────────────────────────────────────────────────────────────────

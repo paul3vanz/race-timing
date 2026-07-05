@@ -115,7 +115,13 @@ export default function HomeScreen() {
                   {formatDate(item.event.date)} · {raceStatus(item.race)}
                 </Text>
               </View>
-              <View style={styles.cardActions}>
+              <View style={[styles.cardActions, styles.cardActionsWrap]}>
+                <Pressable
+                  style={[styles.actionBtn, styles.btnSetup]}
+                  onPress={() => router.push(`/race/${item.race.id}/participants`)}
+                >
+                  <Text style={styles.actionBtnText}>Setup</Text>
+                </Pressable>
                 <Pressable
                   style={[styles.actionBtn, styles.btnTimer]}
                   onPress={() => router.push(`/race/${item.race.id}/timer`)}
@@ -220,12 +226,9 @@ const styles = StyleSheet.create({
     backgroundColor: '#1a1a1a',
     borderRadius: 14,
     padding: 16,
-    flexDirection: 'row',
-    alignItems: 'center',
     gap: 12,
   },
   cardInfo: {
-    flex: 1,
     gap: 4,
   },
   raceName: {
@@ -241,10 +244,16 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 8,
   },
+  cardActionsWrap: {
+    flexWrap: 'wrap',
+  },
   actionBtn: {
     paddingVertical: 8,
     paddingHorizontal: 14,
     borderRadius: 8,
+  },
+  btnSetup: {
+    backgroundColor: '#4e342e',
   },
   btnTimer: {
     backgroundColor: '#1b5e20',

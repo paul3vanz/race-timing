@@ -7,6 +7,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import 'react-native-reanimated';
 
 import { DbErrorBoundary } from '@/components/db-error-boundary';
+import { SyncEngine } from '@/components/sync-engine';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { migrateDbIfNeeded } from '@/lib/db';
 import { useRaceStore } from '@/lib/store';
@@ -27,6 +28,7 @@ export default function RootLayout() {
     <DbErrorBoundary>
       <SafeAreaProvider>
         <SQLiteProvider databaseName="race-timing.db" onInit={migrateDbIfNeeded}>
+          <SyncEngine />
           <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
             <Stack>
               <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
@@ -34,6 +36,7 @@ export default function RootLayout() {
               <Stack.Screen name="race/[raceId]/timer" options={{ headerShown: false }} />
               <Stack.Screen name="race/[raceId]/bib" options={{ headerShown: false }} />
             <Stack.Screen name="race/[raceId]/review" options={{ headerShown: true }} />
+            <Stack.Screen name="race/[raceId]/participants" options={{ headerShown: true }} />
             </Stack>
             <StatusBar style="auto" />
           </ThemeProvider>
