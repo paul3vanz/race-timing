@@ -14,7 +14,7 @@ import {
   upsertParticipant,
   type Race,
 } from './db';
-import { isSupabaseConfigured, supabase } from './supabase';
+import { ensureAnonymousSession, isSupabaseConfigured, supabase } from './supabase';
 
 const BATCH_SIZE = 200;
 
@@ -67,6 +67,8 @@ export async function pushPendingChanges(db: SQLiteDatabase): Promise<SyncResult
 
   let pushed = 0;
   try {
+    await ensureAnonymousSession();
+
     const events = await getUnsyncedEvents(db);
     await pushRows(db, 'events', events, 'id', markEventSynced);
     pushed += events.length;
@@ -245,6 +247,8 @@ export async function startRaceRemote(
   startTime: number,
 ): Promise<number> {
   if (!isSupabaseConfigured) return startTime;
+
+  await ensureAnonymousSession();
 
   const { data, error } = await supabase
     .from('races')

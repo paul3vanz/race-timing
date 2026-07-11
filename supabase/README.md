@@ -21,9 +21,16 @@ files.
 - Table/column names and types match the local schema so sync code can map
   rows across 1:1, aside from the local-only `synced` flag (a remote-only
   push target has no need to track sync state about itself).
-- RLS is enabled on every table but currently permissive (`using (true)`) —
-  there's no device/event auth yet. Tighten these policies when Phase 3
-  (multi-device pairing) adds per-event access control.
+- RLS splits access by role (see
+  `migrations/20260711130000_anon_read_only_split.sql`): `anon` is
+  SELECT-only everywhere, writes require an `authenticated` session. The app
+  gets one automatically via Supabase's anonymous sign-in
+  (`lib/supabase.ts` `ensureAnonymousSession`) before any remote write — no
+  login UI, no separate credential. This is what makes it safe for the
+  black-pear-joggers CMS's public live-results page to use the same anon
+  key: it can only ever read. Per-device/per-event write scoping (rather
+  than "any authenticated session can write to any race") is the real
+  Phase 3 work, still not done.
 - `id` columns are `uuid` with no default; the app always generates ids via
   `expo-crypto`'s `randomUUID()` before insert.
 - The sync worker (`lib/sync.ts`) upserts `events`/`races` on `id`, but
