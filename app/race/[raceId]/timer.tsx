@@ -6,6 +6,8 @@ import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { useRaceStartPoll } from '@/hooks/use-race-start-poll';
+import { useVolumeKeyTap } from '@/hooks/use-volume-key-tap';
+import { isActiveTap } from '@/lib/merge';
 import { useRaceStore } from '@/lib/store';
 import { pullRaceData } from '@/lib/sync';
 
@@ -33,7 +35,10 @@ export default function TimerScreen() {
   const router = useRouter();
 
   const activeRace = useRaceStore((s) => s.activeRace);
+  const event = useRaceStore((s) => s.event);
+  const deviceId = useRaceStore((s) => s.deviceId);
   const timestamps = useRaceStore((s) => s.timestamps);
+  const setRaceStopped = useRaceStore((s) => s.setRaceStopped);
   const loadRace = useRaceStore((s) => s.loadRace);
   const clearActiveRace = useRaceStore((s) => s.clearActiveRace);
   const startRace = useRaceStore((s) => s.startRace);
@@ -57,10 +62,12 @@ export default function TimerScreen() {
         .then(() => refreshData(db))
         .catch(() => {});
     }
-    activateKeepAwakeAsync();
+    // A refused wake lock (browser preview, low-power mode) must not surface as
+    // an unhandled rejection; the screen just may sleep.
+    activateKeepAwakeAsync().catch(() => {});
     return () => {
       clearActiveRace();
-      deactivateKeepAwake();
+      deactivateKeepAwake().catch(() => {});
     };
   }, [raceId]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -90,15 +97,25 @@ export default function TimerScreen() {
     }
   };
 
-  const handleTap = () => {
-    if (!activeRace?.start_time) return;
+  const stopped = event?.status === 'finished';
+  const canTap = Boolean(activeRace?.start_time) && !stopped;
+
+  // `capturedAt` is set when the press came from a hardware volume button
+  // (stamped natively at the moment of the press); a screen tap leaves it out
+  // and recordTimestamp reads Date.now() as its first line instead.
+  const handleTap = (capturedAt?: number) => {
+    if (!canTap) return;
     // Visual + haptic feedback fires immediately; DB write is fire-and-forget.
-    // Date.now() is captured as the first line of recordTimestamp, before any await.
     setFlash(true);
     setTimeout(() => setFlash(false), 120);
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    recordTimestamp(db);
+    recordTimestamp(db, capturedAt);
   };
+
+  // Volume buttons as tap buttons: tactile, work with wet or gloved hands, and
+  // can't be triggered by raindrops on the glass. Only consumed while the race
+  // is live, so they behave normally on the pre-start screen.
+  const volumeKeysActive = useVolumeKeyTap(canTap, (at) => handleTap(at));
 
   // ── Loading ─────────────────────────────────────────────────────────────────
 
@@ -119,8 +136,11 @@ export default function TimerScreen() {
   // ── Derived display values ──────────────────────────────────────────────────
 
   const raceStarted = activeRace.start_time !== null;
-  const count = timestamps.length;
-  const lastTs = timestamps[count - 1];
+  // This device's own taps. With two Timers each phone counts what it pressed;
+  // the merged finisher list is on the Results screen.
+  const ownTaps = timestamps.filter((t) => t.device_id === deviceId && isActiveTap(t));
+  const count = ownTaps.length;
+  const lastTs = ownTaps[count - 1];
   const lastTime =
     lastTs && activeRace.start_time
       ? formatElapsed(lastTs.recorded_at - activeRace.start_time)
@@ -133,7 +153,7 @@ export default function TimerScreen() {
       <Stack.Screen options={{ headerShown: false }} />
       <Pressable
         style={[styles.container, flash && styles.flash]}
-        onPress={raceStarted ? handleTap : undefined}
+        onPress={canTap ? () => handleTap() : undefined}
         android_disableSound
       >
         {/* Sits above the full-screen tap target so it can be pressed on its own,
@@ -149,11 +169,21 @@ export default function TimerScreen() {
 
         {/* Central content changes pre/post start */}
         <View style={styles.centre}>
-          {raceStarted ? (
+          {stopped ? (
+            <View style={styles.preStart}>
+              <Text style={styles.raceName}>Race stopped</Text>
+              <Text style={styles.stoppedNote}>
+                {count} {count === 1 ? 'tap' : 'taps'} recorded on this device.
+              </Text>
+              <Pressable style={styles.reopenBtn} onPress={() => setRaceStopped(db, false)}>
+                <Text style={styles.reopenBtnText}>Reopen race</Text>
+              </Pressable>
+            </View>
+          ) : raceStarted ? (
             <>
               <Text style={styles.count}>{count}</Text>
               <Text style={styles.countLabel}>
-                {count === 1 ? 'finisher' : 'finishers'}
+                {count === 1 ? 'tap' : 'taps'}
               </Text>
               {lastTime !== null && (
                 <Text style={styles.lastTime}>last  {lastTime}</Text>
@@ -170,8 +200,10 @@ export default function TimerScreen() {
         </View>
 
         {/* Barely-visible tap hint — confirms to the operator the screen is live */}
-        {raceStarted && (
-          <Text style={styles.hint}>tap anywhere to record</Text>
+        {canTap && (
+          <Text style={styles.hint}>
+            {volumeKeysActive ? 'tap anywhere or press a volume button to record' : 'tap anywhere to record'}
+          </Text>
         )}
       </Pressable>
     </>
@@ -265,8 +297,24 @@ const styles = StyleSheet.create({
     fontSize: 30,
     fontWeight: '700',
   },
+  stoppedNote: {
+    color: '#555',
+    fontSize: 15,
+    textAlign: 'center',
+  },
+  reopenBtn: {
+    backgroundColor: '#1e1e1e',
+    paddingVertical: 16,
+    paddingHorizontal: 40,
+    borderRadius: 14,
+  },
+  reopenBtnText: {
+    color: '#aaa',
+    fontSize: 17,
+    fontWeight: '600',
+  },
   hint: {
-    color: '#1e1e1e',
+    color: '#2a2a2a',
     fontSize: 13,
     textAlign: 'center',
   },

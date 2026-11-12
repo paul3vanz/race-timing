@@ -6,19 +6,24 @@ import { create } from 'zustand';
 
 import {
   assignBibToTimestamp,
+  getEventForRace,
   getFinishesByRace,
   getParticipantsByRace,
   getRace,
   getTimestampsByRace,
-  getUnassignedTimestamps,
   recordDirectFinish,
   recordTimestamp as dbRecordTimestamp,
   setRaceStartTime,
+  updateEventStatus,
+  voidFinish,
+  voidTimestamp,
+  type Event,
   type Finish,
   type Participant,
   type Race,
   type Timestamp,
 } from './db';
+import { buildQueue, type QueueItem } from './merge';
 import { startRaceRemote } from './sync';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -29,12 +34,22 @@ interface RaceStore {
 
   // Active race context — set when a race screen is opened
   activeRace: Race | null;
+  event: Event | null; // the race's event: its status is what "stopped" means
 
-  // In-memory mirrors of the DB for the active race
-  timestamps: Timestamp[];  // all timestamps, ordered by sequence_num
-  unassigned: Timestamp[];  // timestamps with no finish record yet
-  finishes: Finish[];       // completed finish records, ordered by gun_time
+  // In-memory mirrors of the DB for the active race. These hold EVERYTHING in
+  // the local DB for the race, including rows pulled from other devices.
+  timestamps: Timestamp[];
+  finishes: Finish[];
   participants: Participant[]; // full roster, for bib -> name lookups
+
+  // Taps still waiting for a bib, in finishing order across ALL Timer devices
+  // (taps from two Timers for the same finisher are one entry). Derived from
+  // timestamps + finishes, never stored.
+  unassigned: QueueItem[];
+
+  // Finish ids this device typed since the screen opened, newest last — what
+  // "Undo" walks back through.
+  entryStack: string[];
 
   // ── Actions ─────────────────────────────────────────────────────────────────
 
@@ -57,13 +72,26 @@ interface RaceStore {
   // already has one — a stale poll response must never undo a local start.
   adoptRemoteStartTime: (db: SQLiteDatabase, startTime: number) => Promise<void>;
 
-  // Hot path: capture Date.now() immediately, write async, update store
-  recordTimestamp: (db: SQLiteDatabase) => Promise<Timestamp | null>;
+  // Marks the race finished (or reopens it). Syncs like any other event
+  // change, so every device learns the race has been stopped.
+  setRaceStopped: (db: SQLiteDatabase, stopped: boolean) => Promise<void>;
 
-  // Assign a bib to the next unassigned timestamp in sequence
+  // Hot path: capture Date.now() immediately, write async, update store.
+  // `capturedAt` lets a caller that already has a precise timestamp (the
+  // volume-key listener stamps it natively) pass it through.
+  recordTimestamp: (db: SQLiteDatabase, capturedAt?: number) => Promise<Timestamp | null>;
+
+  // Assign a bib to the next unassigned finisher in the queue
   assignBib: (db: SQLiteDatabase, bibNumber: string) => Promise<Finish | null>;
 
-  // Re-query the DB; call after returning from background or manual corrections
+  // Remove the last bib this device typed (puts its finisher back in the queue)
+  undoLastBib: (db: SQLiteDatabase) => Promise<void>;
+
+  // Discard the tap at the head of the queue as a phantom (stray press)
+  skipQueueHead: (db: SQLiteDatabase) => Promise<void>;
+
+  // Re-query the DB; call after returning from background, after a sync pulled
+  // other devices' rows, or after manual corrections
   refreshData: (db: SQLiteDatabase) => Promise<void>;
 }
 
@@ -92,10 +120,12 @@ async function resolveDeviceId(): Promise<string> {
 export const useRaceStore = create<RaceStore>((set, get) => ({
   deviceId: null,
   activeRace: null,
+  event: null,
   timestamps: [],
-  unassigned: [],
   finishes: [],
   participants: [],
+  unassigned: [],
+  entryStack: [],
 
   initDeviceId: async () => {
     const deviceId = await resolveDeviceId();
@@ -103,25 +133,45 @@ export const useRaceStore = create<RaceStore>((set, get) => ({
   },
 
   loadRace: async (db, raceId) => {
-    const [race, timestamps, unassigned, finishes, participants] = await Promise.all([
+    const [race, event, timestamps, finishes, participants] = await Promise.all([
       getRace(db, raceId),
+      getEventForRace(db, raceId),
       getTimestampsByRace(db, raceId),
-      getUnassignedTimestamps(db, raceId),
       getFinishesByRace(db, raceId),
       getParticipantsByRace(db, raceId),
     ]);
-    set({ activeRace: race, timestamps, unassigned, finishes, participants });
+    set({
+      activeRace: race,
+      event,
+      timestamps,
+      finishes,
+      participants,
+      unassigned: buildQueue(timestamps, finishes),
+      entryStack: [],
+    });
   },
 
   clearActiveRace: () => {
-    set({ activeRace: null, timestamps: [], unassigned: [], finishes: [], participants: [] });
+    set({
+      activeRace: null,
+      event: null,
+      timestamps: [],
+      finishes: [],
+      participants: [],
+      unassigned: [],
+      entryStack: [],
+    });
   },
 
   startRace: async (db) => {
-    const { activeRace } = get();
+    const { activeRace, event } = get();
     if (!activeRace || activeRace.start_time !== null) return;
     const startTime = Date.now();
     await setRaceStartTime(db, activeRace.id, startTime);
+    if (event && event.status === 'pending') {
+      await updateEventStatus(db, event.id, 'active');
+      set((state) => (state.event?.id === event.id ? { event: { ...state.event, status: 'active' } } : {}));
+    }
     set((state) =>
       state.activeRace?.id === activeRace.id ? { activeRace: { ...state.activeRace, start_time: startTime } } : {},
     );
@@ -153,51 +203,95 @@ export const useRaceStore = create<RaceStore>((set, get) => ({
     );
   },
 
-  recordTimestamp: async (db) => {
+  setRaceStopped: async (db, stopped) => {
+    const { event } = get();
+    if (!event) return;
+    const status: Event['status'] = stopped ? 'finished' : 'active';
+    await updateEventStatus(db, event.id, status);
+    set((state) => (state.event?.id === event.id ? { event: { ...state.event, status } } : {}));
+  },
+
+  recordTimestamp: async (db, capturedAt) => {
     // Capture the time first — before any async work — to stay accurate.
-    const recordedAt = Date.now();
-    const { activeRace, deviceId } = get();
-    if (!activeRace || !deviceId) return null;
+    const recordedAt = capturedAt ?? Date.now();
+    const { activeRace, deviceId, event } = get();
+    if (!activeRace || !deviceId || event?.status === 'finished') return null;
 
     const ts = await dbRecordTimestamp(db, activeRace.id, deviceId, recordedAt);
-    set((state) => ({
-      timestamps: [...state.timestamps, ts],
-      unassigned: [...state.unassigned, ts],
-    }));
+    set((state) => {
+      const timestamps = [...state.timestamps, ts];
+      return { timestamps, unassigned: buildQueue(timestamps, state.finishes) };
+    });
     return ts;
   },
 
   assignBib: async (db, bibNumber) => {
     const capturedAt = Date.now();
-    const { activeRace, unassigned, deviceId } = get();
-    if (!activeRace?.start_time || !deviceId) return null;
+    const { activeRace, unassigned, deviceId, event } = get();
+    if (!activeRace?.start_time || !deviceId || event?.status === 'finished') return null;
 
-    let finish: Finish;
-    if (unassigned.length > 0) {
-      const next = unassigned[0];
-      finish = await assignBibToTimestamp(db, activeRace.id, bibNumber, next, activeRace.start_time, deviceId);
-      set((state) => ({
-        unassigned: state.unassigned.slice(1),
-        finishes: [...state.finishes, finish].sort((a, b) => (a.gun_time ?? 0) - (b.gun_time ?? 0)),
-      }));
-    } else {
-      finish = await recordDirectFinish(db, activeRace.id, bibNumber, capturedAt - activeRace.start_time, deviceId);
-      set((state) => ({
-        finishes: [...state.finishes, finish].sort((a, b) => (a.gun_time ?? 0) - (b.gun_time ?? 0)),
-      }));
-    }
+    const head = unassigned[0];
+    const finish = head
+      ? await assignBibToTimestamp(db, activeRace.id, bibNumber, head.id, head.time - activeRace.start_time, deviceId)
+      : await recordDirectFinish(db, activeRace.id, bibNumber, capturedAt - activeRace.start_time, deviceId);
+
+    set((state) => {
+      const finishes = [...state.finishes, finish].sort((a, b) => (a.gun_time ?? 0) - (b.gun_time ?? 0));
+      return {
+        finishes,
+        unassigned: buildQueue(state.timestamps, finishes),
+        entryStack: [...state.entryStack, finish.id],
+      };
+    });
     return finish;
+  },
+
+  undoLastBib: async (db) => {
+    const { entryStack } = get();
+    const id = entryStack[entryStack.length - 1];
+    if (!id) return;
+    await voidFinish(db, id);
+    set((state) => {
+      const finishes = state.finishes.map((f) => (f.id === id ? { ...f, voided: 1 as const, synced: 0 as const } : f));
+      return {
+        finishes,
+        unassigned: buildQueue(state.timestamps, finishes),
+        entryStack: state.entryStack.slice(0, -1),
+      };
+    });
+  },
+
+  skipQueueHead: async (db) => {
+    const head = get().unassigned[0];
+    if (!head) return;
+    for (const tapId of head.tapIds) await voidTimestamp(db, tapId);
+    set((state) => {
+      const timestamps = state.timestamps.map((t) =>
+        head.tapIds.includes(t.id) ? { ...t, voided: 1 as const, synced: 0 as const } : t,
+      );
+      return { timestamps, unassigned: buildQueue(timestamps, state.finishes) };
+    });
   },
 
   refreshData: async (db) => {
     const { activeRace } = get();
     if (!activeRace) return;
-    const [timestamps, unassigned, finishes, participants] = await Promise.all([
+    const [race, event, timestamps, finishes, participants] = await Promise.all([
+      getRace(db, activeRace.id),
+      getEventForRace(db, activeRace.id),
       getTimestampsByRace(db, activeRace.id),
-      getUnassignedTimestamps(db, activeRace.id),
       getFinishesByRace(db, activeRace.id),
       getParticipantsByRace(db, activeRace.id),
     ]);
-    set({ timestamps, unassigned, finishes, participants });
+    set((state) => ({
+      // Keep a start_time this device already holds even if the read raced a
+      // write; the DB is the source of truth otherwise.
+      activeRace: race ? { ...race, start_time: race.start_time ?? state.activeRace?.start_time ?? null } : state.activeRace,
+      event: event ?? state.event,
+      timestamps,
+      finishes,
+      participants,
+      unassigned: buildQueue(timestamps, finishes),
+    }));
   },
 }));
