@@ -67,6 +67,7 @@ export interface Finish {
   device_id: string; // which device recorded/typed this entry
   flagged: 0 | 1; // low-confidence auto-match from reconciliation, needs an eyeball
   duplicate_of: string | null; // set when a backup device's entry corroborates another finish row, not a separate finisher
+  voided: 0 | 1; // operator removed this bib entry as a mistake — never deleted, so the removal syncs
   synced: 0 | 1;
 }
 
@@ -215,6 +216,19 @@ const MIGRATIONS: string[] = [
   CREATE UNIQUE INDEX IF NOT EXISTS finishes_race_bib_idx
     ON finishes(race_id, bib_number) WHERE duplicate_of IS NULL AND timestamp_id IS NOT NULL;
   `,
+
+  // v9 — allow the same bib on more than one finish, and add finishes.voided.
+  // v8's unique index made a mistyped/duplicated bib throw at entry time,
+  // which froze the Bib numpad mid-race. A duplicate is now a *result problem*
+  // surfaced and fixed on the Results screen (where the wrong entry can be
+  // edited), not something the Bib operator is blocked by while a queue builds
+  // up behind them. `voided` lets the Results screen remove a bib entry in a
+  // way that syncs to other devices (a hard DELETE would not).
+  `
+  DROP INDEX IF EXISTS finishes_race_bib_idx;
+  CREATE INDEX IF NOT EXISTS finishes_race_bib_idx ON finishes(race_id, bib_number);
+  ALTER TABLE finishes ADD COLUMN voided INTEGER NOT NULL DEFAULT 0;
+  `,
 ];
 
 export async function migrateDbIfNeeded(db: SQLite.SQLiteDatabase): Promise<void> {
@@ -246,6 +260,7 @@ export async function migrateDbIfNeeded(db: SQLite.SQLiteDatabase): Promise<void
   await ensureColumn(db, 'finishes', 'flagged', 'INTEGER NOT NULL DEFAULT 0');
   await ensureColumn(db, 'finishes', 'device_id', "TEXT NOT NULL DEFAULT 'unknown'");
   await ensureColumn(db, 'finishes', 'duplicate_of', 'TEXT REFERENCES finishes(id)');
+  await ensureColumn(db, 'finishes', 'voided', 'INTEGER NOT NULL DEFAULT 0');
 }
 
 async function ensureColumn(
@@ -287,6 +302,16 @@ export async function getEvents(db: SQLite.SQLiteDatabase): Promise<Event[]> {
 
 export async function getEvent(db: SQLite.SQLiteDatabase, id: string): Promise<Event | null> {
   return db.getFirstAsync<Event>('SELECT * FROM events WHERE id = ?', [id]);
+}
+
+export async function getEventForRace(
+  db: SQLite.SQLiteDatabase,
+  raceId: string,
+): Promise<Event | null> {
+  return db.getFirstAsync<Event>(
+    'SELECT e.* FROM events e JOIN races r ON r.event_id = e.id WHERE r.id = ?',
+    [raceId],
+  );
 }
 
 export async function createEvent(
@@ -514,22 +539,7 @@ export async function getTimestampsByRace(
   raceId: string,
 ): Promise<Timestamp[]> {
   return db.getAllAsync<Timestamp>(
-    'SELECT * FROM timestamps WHERE race_id = ? ORDER BY sequence_num',
-    [raceId],
-  );
-}
-
-export async function getUnassignedTimestamps(
-  db: SQLite.SQLiteDatabase,
-  raceId: string,
-): Promise<Timestamp[]> {
-  // Timestamps that have no matching finish record yet
-  return db.getAllAsync<Timestamp>(
-    `SELECT t.*
-     FROM timestamps t
-     LEFT JOIN finishes f ON f.timestamp_id = t.id
-     WHERE t.race_id = ? AND f.id IS NULL AND t.voided = 0 AND t.duplicate_of IS NULL
-     ORDER BY t.sequence_num`,
+    'SELECT * FROM timestamps WHERE race_id = ? ORDER BY recorded_at',
     [raceId],
   );
 }
@@ -566,65 +576,6 @@ export async function markTimestampSynced(
   await db.runAsync('UPDATE timestamps SET synced = 1 WHERE id = ?', [id]);
 }
 
-// ── Review ────────────────────────────────────────────────────────────────────
-
-export interface ReviewRow {
-  // null for a direct-entry finish (bib typed with no Timer device running —
-  // see the second half of the UNION below), never null for a gap row.
-  timestamp_id: string | null;
-  sequence_num: number | null;
-  recorded_at: number | null;
-  finish_id: string | null;
-  bib_number: string | null;
-  gun_time: number | null;
-  flagged: 0 | 1 | null; // low-confidence reconciled match, still worth a second look
-}
-
-export async function getReviewRows(
-  db: SQLite.SQLiteDatabase,
-  raceId: string,
-): Promise<ReviewRow[]> {
-  // SQLite has no FULL OUTER JOIN, so this is a manual one via UNION ALL:
-  // timestamps left-joined to finishes (covers matched + unmatched-timestamp
-  // "gap" rows) UNION finishes that were never joined to a timestamp at all —
-  // i.e. bibs typed on this device with no Timer device running. Without the
-  // second half, a bib-only race (no timestamps table rows whatsoever) would
-  // show as empty even though it has results.
-  // SQLite only allows bare column names / ordinals in the ORDER BY of a
-  // compound (UNION) SELECT, not expressions — so the union is wrapped in a
-  // subquery and ordered from the (non-compound) outer SELECT instead.
-  return db.getAllAsync<ReviewRow>(
-    `SELECT * FROM (
-       SELECT
-         t.id         AS timestamp_id,
-         t.sequence_num,
-         t.recorded_at,
-         f.id         AS finish_id,
-         f.bib_number,
-         f.gun_time,
-         f.flagged
-       FROM timestamps t
-       LEFT JOIN finishes f ON f.timestamp_id = t.id
-       WHERE t.race_id = ? AND t.voided = 0 AND t.duplicate_of IS NULL
-
-       UNION ALL
-
-       SELECT
-         NULL AS timestamp_id,
-         NULL AS sequence_num,
-         NULL AS recorded_at,
-         f.id AS finish_id,
-         f.bib_number,
-         f.gun_time,
-         f.flagged
-       FROM finishes f
-       WHERE f.race_id = ? AND f.timestamp_id IS NULL AND f.duplicate_of IS NULL
-     )
-     ORDER BY sequence_num IS NULL, sequence_num`,
-    [raceId, raceId],
-  );
-}
-
 // ── Finishes ──────────────────────────────────────────────────────────────────
 
 export async function getFinishesByRace(
@@ -637,21 +588,22 @@ export async function getFinishesByRace(
   );
 }
 
+// Links a typed bib to a Timer tap. `timestampId` is the cluster's
+// representative tap (see lib/merge.ts) and `gunTime` its race-relative time.
 export async function assignBibToTimestamp(
   db: SQLite.SQLiteDatabase,
   raceId: string,
   bibNumber: string,
-  timestamp: Timestamp,
-  raceStartTime: number,
+  timestampId: string,
+  gunTime: number,
   deviceId: string,
 ): Promise<Finish> {
   const id = uuid();
-  const gun_time = timestamp.recorded_at - raceStartTime;
   await db.runAsync(
     'INSERT INTO finishes (id, race_id, bib_number, timestamp_id, gun_time, device_id) VALUES (?, ?, ?, ?, ?, ?)',
-    [id, raceId, bibNumber, timestamp.id, gun_time, deviceId],
+    [id, raceId, bibNumber, timestampId, gunTime, deviceId],
   );
-  return { id, race_id: raceId, bib_number: bibNumber, timestamp_id: timestamp.id, gun_time, chip_time: null, device_id: deviceId, flagged: 0, duplicate_of: null, synced: 0 };
+  return { id, race_id: raceId, bib_number: bibNumber, timestamp_id: timestampId, gun_time: gunTime, chip_time: null, device_id: deviceId, flagged: 0, duplicate_of: null, voided: 0, synced: 0 };
 }
 
 export async function recordDirectFinish(
@@ -666,52 +618,49 @@ export async function recordDirectFinish(
     'INSERT INTO finishes (id, race_id, bib_number, timestamp_id, gun_time, device_id) VALUES (?, ?, ?, NULL, ?, ?)',
     [id, raceId, bibNumber, gunTime, deviceId],
   );
-  return { id, race_id: raceId, bib_number: bibNumber, timestamp_id: null, gun_time: gunTime, chip_time: null, device_id: deviceId, flagged: 0, duplicate_of: null, synced: 0 };
+  return { id, race_id: raceId, bib_number: bibNumber, timestamp_id: null, gun_time: gunTime, chip_time: null, device_id: deviceId, flagged: 0, duplicate_of: null, voided: 0, synced: 0 };
 }
 
-// ── Reconciliation (cross-device merge) ──────────────────────────────────────
+// ── Results editing ──────────────────────────────────────────────────────────
+//
+// Every edit below flips `synced` back to 0, so it's pushed to Supabase and —
+// because the pull only overwrites rows that are already synced (see
+// lib/sync.ts pullRaceData) — reaches every other device without clobbering
+// an edit that hasn't been pushed yet. Last device to push wins.
 
-// Race-wide (not per-device) orphan timestamps, ordered by wall-clock time —
-// the input to lib/reconcile.ts's clustering + alignment. Excludes rows
-// already resolved as a discard or a corroborating duplicate.
-export async function getOrphanTimestamps(
+// Corrects a mistyped bib on an existing finish (e.g. 123 entered twice when
+// one was really 132).
+export async function updateFinishBib(
   db: SQLite.SQLiteDatabase,
-  raceId: string,
-): Promise<Timestamp[]> {
-  return db.getAllAsync<Timestamp>(
-    `SELECT t.*
-     FROM timestamps t
-     LEFT JOIN finishes f ON f.timestamp_id = t.id
-     WHERE t.race_id = ? AND f.id IS NULL AND t.voided = 0 AND t.duplicate_of IS NULL
-     ORDER BY t.recorded_at`,
-    [raceId],
-  );
+  id: string,
+  bibNumber: string,
+): Promise<void> {
+  await db.runAsync('UPDATE finishes SET bib_number = ?, synced = 0 WHERE id = ?', [bibNumber, id]);
 }
 
-// Race-wide orphan finishes (typed on a device with no local timestamp queue
-// to pair against — e.g. a standalone Bib device), ordered by their own
-// capture time.
-export async function getOrphanFinishes(
-  db: SQLite.SQLiteDatabase,
-  raceId: string,
-): Promise<Finish[]> {
-  return db.getAllAsync<Finish>(
-    `SELECT * FROM finishes
-     WHERE race_id = ? AND timestamp_id IS NULL AND duplicate_of IS NULL
-     ORDER BY gun_time`,
-    [raceId],
-  );
+// Removes a bib entry from the results (typed by mistake, or for nobody).
+// Soft, like voidTimestamp, so the removal syncs.
+export async function voidFinish(db: SQLite.SQLiteDatabase, id: string): Promise<void> {
+  await db.runAsync('UPDATE finishes SET voided = 1, synced = 0 WHERE id = ?', [id]);
 }
 
-// Backfills a tap a Timer device missed, or records a manually-adjusted time
-// for one. Mirrors recordTimestamp's per-device sequencing so it slots into
-// the same ordering machinery, but under a synthetic 'manual' device.
+// Soft-discard a double-click — never deleted, so the audit trail (and any
+// already-pushed remote copy) stays intact.
+export async function voidTimestamp(db: SQLite.SQLiteDatabase, id: string): Promise<void> {
+  await db.runAsync('UPDATE timestamps SET voided = 1, synced = 0 WHERE id = ?', [id]);
+}
+
+// Backfills a tap every Timer device missed. Mirrors recordTimestamp's
+// per-device sequencing so it slots into the same ordering machinery, but
+// under a synthetic per-device 'manual-xxxx' id, so two devices backfilling at
+// once can't produce the same (race, device, sequence) on the remote.
 export async function insertManualTimestamp(
   db: SQLite.SQLiteDatabase,
   raceId: string,
   recordedAt: number,
+  insertingDeviceId: string,
 ): Promise<Timestamp> {
-  const deviceId = 'manual';
+  const deviceId = `manual-${insertingDeviceId.slice(0, 8)}`;
   const result = await db.getFirstAsync<{ max_seq: number | null }>(
     'SELECT MAX(sequence_num) AS max_seq FROM timestamps WHERE race_id = ? AND device_id = ?',
     [raceId, deviceId],
@@ -725,23 +674,6 @@ export async function insertManualTimestamp(
   return { id, race_id: raceId, recorded_at: recordedAt, device_id: deviceId, sequence_num, voided: 0, is_manual: 1, duplicate_of: null, synced: 0 };
 }
 
-// Soft-discard a double-click — never deleted, so the audit trail (and any
-// already-pushed remote copy) stays intact.
-export async function voidTimestamp(db: SQLite.SQLiteDatabase, id: string): Promise<void> {
-  await db.runAsync('UPDATE timestamps SET voided = 1, synced = 0 WHERE id = ?', [id]);
-}
-
-// Marks a raw timestamp as a backup device's corroborating capture of
-// `canonicalId`'s event rather than a separate finisher. Kept for audit
-// trail / diagnostics, excluded from future reconciliation passes.
-export async function markTimestampDuplicate(
-  db: SQLite.SQLiteDatabase,
-  id: string,
-  canonicalId: string,
-): Promise<void> {
-  await db.runAsync('UPDATE timestamps SET duplicate_of = ?, synced = 0 WHERE id = ?', [canonicalId, id]);
-}
-
 // Marks a raw finish as a backup device's corroborating entry for the same
 // bib/event as `canonicalId`, not a separate finisher.
 export async function markFinishDuplicate(
@@ -752,44 +684,9 @@ export async function markFinishDuplicate(
   await db.runAsync('UPDATE finishes SET duplicate_of = ?, synced = 0 WHERE id = ?', [canonicalId, id]);
 }
 
-// Confirms a proposed reconciliation pairing: links an orphan finish (typed
-// on a device with no local timestamp queue) to the Timer tap it was aligned
-// with, updating gun_time to the Timer device's precise capture instead of
-// the Bib device's typed-at time. Updates the existing finish row (finishes
-// are documented last-write-wins, unlike immutable timestamps) rather than
-// inserting a second one, so it never trips the (race_id, bib_number) unique
-// index.
-export interface DeviceActivity {
-  device_id: string;
-  kept: number; // canonical rows this device contributed (not a duplicate, not voided)
-  duplicate: number; // rows folded into another device's capture as a corroboration
-  voided: number; // rows the operator discarded as a mistake (e.g. a double-click)
-}
-
-// Per-device breakdown across both timestamps and finishes, for the Review
-// screen's diagnostics strip — reflects whatever's already been committed
-// (voided/duplicate_of), not a live re-run of the reconciliation proposal.
-export async function getDeviceActivity(
-  db: SQLite.SQLiteDatabase,
-  raceId: string,
-): Promise<DeviceActivity[]> {
-  const rows = await db.getAllAsync<{ device_id: string; kept: number; duplicate: number; voided: number }>(
-    `SELECT device_id,
-            SUM(CASE WHEN voided = 0 AND duplicate_of IS NULL THEN 1 ELSE 0 END) AS kept,
-            SUM(CASE WHEN duplicate_of IS NOT NULL THEN 1 ELSE 0 END) AS duplicate,
-            SUM(CASE WHEN voided = 1 THEN 1 ELSE 0 END) AS voided
-     FROM (
-       SELECT device_id, voided, duplicate_of FROM timestamps WHERE race_id = ?
-       UNION ALL
-       SELECT device_id, 0 AS voided, duplicate_of FROM finishes WHERE race_id = ?
-     )
-     GROUP BY device_id
-     ORDER BY device_id`,
-    [raceId, raceId],
-  );
-  return rows;
-}
-
+// Points an existing finish at a (different) Timer tap, taking the tap's
+// precise capture time instead of whenever the bib was typed. Updates the row
+// in place (finishes are last-write-wins, unlike immutable timestamps).
 export async function linkFinishToTimestamp(
   db: SQLite.SQLiteDatabase,
   finishId: string,
@@ -803,15 +700,15 @@ export async function linkFinishToTimestamp(
   );
 }
 
-export async function getFinishByBib(
+// Re-links many finishes at once in a single transaction (used by the Results
+// screen's "re-match in order" repair).
+export async function relinkFinishes(
   db: SQLite.SQLiteDatabase,
-  raceId: string,
-  bibNumber: string,
-): Promise<Finish | null> {
-  return db.getFirstAsync<Finish>(
-    'SELECT * FROM finishes WHERE race_id = ? AND bib_number = ?',
-    [raceId, bibNumber],
-  );
+  links: { finishId: string; timestampId: string; gunTime: number }[],
+): Promise<void> {
+  await db.withTransactionAsync(async () => {
+    for (const l of links) await linkFinishToTimestamp(db, l.finishId, l.timestampId, l.gunTime, false);
+  });
 }
 
 export async function getUnsyncedFinishes(db: SQLite.SQLiteDatabase): Promise<Finish[]> {

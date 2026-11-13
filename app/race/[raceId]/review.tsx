@@ -1,69 +1,65 @@
 import { File, Paths } from 'expo-file-system';
-import { Stack, useLocalSearchParams } from 'expo-router';
+import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import { useSQLiteContext } from 'expo-sqlite';
-import { useCallback, useEffect, useState } from 'react';
+import Papa from 'papaparse';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Alert, FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
 
-import { DeviceActivityStrip, SpreadsheetRow, type SpreadsheetRowData } from '@/components/reconcile-row';
+import { BibEditSheet, type SheetAction } from '@/components/bib-edit-sheet';
+import { DeviceActivityStrip, ResultRowView, type EditTarget } from '@/components/reconcile-row';
+import { useRaceSync } from '@/hooks/use-race-sync';
 import {
   assignBibToTimestamp,
-  getDeviceActivity,
-  getOrphanFinishes,
-  getOrphanTimestamps,
+  getEventForRace,
+  getFinishesByRace,
+  getParticipantsByRace,
   getRace,
-  getReviewRows,
+  getTimestampsByRace,
   insertManualTimestamp,
   linkFinishToTimestamp,
   markFinishDuplicate,
-  markTimestampDuplicate,
+  relinkFinishes,
+  updateFinishBib,
+  voidFinish,
   voidTimestamp,
-  type DeviceActivity,
+  participantDisplayName,
+  type Event,
   type Finish,
+  type Participant,
   type Race,
-  type ReviewRow,
   type Timestamp,
 } from '@/lib/db';
-import {
-  alignFinishers,
-  clusterBibEntries,
-  clusterTimerTaps,
-  type CanonicalBibEntry,
-  type CanonicalTap,
-  type ReconciledPair,
-} from '@/lib/reconcile';
-import { pullRaceData } from '@/lib/sync';
+import { formatGunTime, formatGunTimeTenths } from '@/lib/format';
+import { buildResultsView, planRelinkInOrder } from '@/lib/merge';
+import { TAP_CLUSTER_WINDOW_MS, type CanonicalBibEntry, type CanonicalTap, type ReconciledPair } from '@/lib/reconcile';
 import { useRaceStore } from '@/lib/store';
-
-// ── Formatting ────────────────────────────────────────────────────────────────
-
-function formatGunTime(ms: number): string {
-  const totalSec = Math.floor(ms / 1000);
-  const sec = totalSec % 60;
-  const totalMin = Math.floor(totalSec / 60);
-  const min = totalMin % 60;
-  const hrs = Math.floor(totalMin / 60);
-  return hrs > 0
-    ? `${p2(hrs)}:${p2(min)}:${p2(sec)}`
-    : `${p2(min)}:${p2(sec)}`;
-}
-
-function p2(n: number) {
-  return n.toString().padStart(2, '0');
-}
 
 // ── CSV ───────────────────────────────────────────────────────────────────────
 
-function buildCsv(confirmed: ReviewRow[]): string {
-  const lines = ['Position,Bib,Gun Time'];
-  confirmed.forEach((row, i) => {
-    lines.push(`${i + 1},${row.bib_number},${formatGunTime(row.gun_time ?? 0)}`);
+function buildCsv(
+  finishers: { bib: string; time: number }[],
+  participants: Participant[],
+): string {
+  const byBib = new Map(participants.map((p) => [p.bib_number, p]));
+  return Papa.unparse({
+    fields: ['Position', 'Bib', 'Name', 'Club', 'Gender', 'Category', 'Gun Time'],
+    data: finishers.map((f, i) => {
+      const p = byBib.get(f.bib);
+      return [
+        i + 1,
+        f.bib,
+        p ? participantDisplayName(p) : '',
+        p?.club ?? '',
+        p?.gender ?? '',
+        p?.category ?? '',
+        formatGunTime(f.time),
+      ];
+    }),
   });
-  return lines.join('\n');
 }
 
-async function exportCsv(raceName: string, confirmed: ReviewRow[]) {
-  const csv = buildCsv(confirmed);
+async function exportCsv(raceName: string, csv: string) {
   const slug = raceName.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
   const file = new File(Paths.document, `${slug}-results.csv`);
   file.write(csv);
@@ -80,271 +76,279 @@ async function exportCsv(raceName: string, confirmed: ReviewRow[]) {
   }
 }
 
-// ── Reconciliation proposal ───────────────────────────────────────────────────
-
-interface Proposal {
-  pairs: ReconciledPair[];
-  unmatchedTaps: CanonicalTap[];
-  unmatchedBibs: CanonicalBibEntry[]; // no disagreement — genuinely just missing a tap
-  disagreements: CanonicalBibEntry[]; // devices reported different bib numbers
-  tapById: Map<string, Timestamp>;
-  finishById: Map<string, Finish>;
-}
-
-const EMPTY_PROPOSAL: Proposal = {
-  pairs: [],
-  unmatchedTaps: [],
-  unmatchedBibs: [],
-  disagreements: [],
-  tapById: new Map(),
-  finishById: new Map(),
-};
-
-async function buildProposal(
-  db: ReturnType<typeof useSQLiteContext>,
-  raceId: string,
-  raceStartTime: number | null,
-): Promise<Proposal> {
-  const [rawTaps, rawFinishes] = await Promise.all([
-    getOrphanTimestamps(db, raceId),
-    getOrphanFinishes(db, raceId),
-  ]);
-
-  const tapById = new Map(rawTaps.map((t) => [t.id, t]));
-  const finishById = new Map(rawFinishes.map((f) => [f.id, f]));
-
-  const canonicalTaps = clusterTimerTaps(rawTaps.map((t) => ({ id: t.id, deviceId: t.device_id, time: t.recorded_at })));
-  const canonicalBibs = clusterBibEntries(
-    rawFinishes.map((f) => ({
-      id: f.id,
-      deviceId: f.device_id,
-      bibNumber: f.bib_number,
-      // Bring gun_time (race-relative) onto the same absolute clock basis as
-      // tap.recorded_at, so the alignment cost function compares like with like.
-      time: (raceStartTime ?? 0) + (f.gun_time ?? 0),
-    })),
-  );
-
-  const { pairs, unmatchedTaps, unmatchedBibs } = alignFinishers(canonicalTaps, canonicalBibs);
-
-  return {
-    pairs,
-    unmatchedTaps,
-    unmatchedBibs: unmatchedBibs.filter((b) => b.disagreement === null),
-    disagreements: canonicalBibs.filter((b) => b.disagreement !== null),
-    tapById,
-    finishById,
-  };
-}
-
-// ── Spreadsheet row model ─────────────────────────────────────────────────────
-//
-// One continuous, time-ordered list instead of a "results" list with a
-// separate "problems" list underneath — a confirmed match, a pending
-// proposal, a disagreement, and a gap on either side all read as rows in the
-// same sequence, so a blank cell or a dashed row is visible right where it
-// happened rather than being sorted away into its own section.
-
-interface PositionedRow {
-  key: string;
-  position: number | null; // only rows with a bib identity get a running position
-  data: SpreadsheetRowData;
-}
-
-function buildSpreadsheetRows(rows: ReviewRow[], proposal: Proposal, raceStartTime: number | null): PositionedRow[] {
-  const startTime = raceStartTime ?? 0;
-  const disagreementBibIds = new Set(proposal.disagreements.map((d) => d.sourceIds[0]));
-
-  const unpositioned: { key: string; time: number; hasBib: boolean; data: SpreadsheetRowData }[] = [];
-
-  for (const row of rows) {
-    if (row.finish_id === null) continue; // pure gap — represented via unmatchedTaps below
-    unpositioned.push({
-      key: row.finish_id,
-      time: row.gun_time ?? 0,
-      hasBib: true,
-      data: { kind: 'linked', time: row.gun_time ?? 0, finishId: row.finish_id, bibNumber: row.bib_number ?? '', flagged: row.flagged === 1 },
-    });
-  }
-
-  for (const pair of proposal.pairs) {
-    if (disagreementBibIds.has(pair.bib.sourceIds[0])) continue; // shown via the disagreement row instead
-    const tapTime = pair.tap.time - startTime;
-    const bibTime = pair.bib.time - startTime;
-    unpositioned.push({
-      key: `pair-${pair.bib.sourceIds[0]}`,
-      time: tapTime,
-      hasBib: true,
-      data: { kind: 'proposed', time: tapTime, tapTime, bibTime, flagged: pair.flagged, pair },
-    });
-  }
-
-  for (const entry of proposal.disagreements) {
-    const pair = proposal.pairs.find((p) => p.bib.sourceIds[0] === entry.sourceIds[0]) ?? null;
-    const tapTime = pair ? pair.tap.time - startTime : null;
-    unpositioned.push({
-      key: `disagreement-${entry.sourceIds[0]}`,
-      time: tapTime ?? entry.time - startTime,
-      hasBib: true,
-      data: { kind: 'disagreement', time: tapTime ?? entry.time - startTime, tapTime, entry, pair },
-    });
-  }
-
-  for (const tap of proposal.unmatchedTaps) {
-    unpositioned.push({
-      key: `tap-${tap.sourceIds[0]}`,
-      time: tap.time - startTime,
-      hasBib: false,
-      data: { kind: 'gap-tap', time: tap.time - startTime, tap },
-    });
-  }
-
-  for (const bib of proposal.unmatchedBibs) {
-    const bibTime = bib.time - startTime;
-    unpositioned.push({
-      key: `bib-${bib.sourceIds[0]}`,
-      time: bibTime,
-      hasBib: true,
-      data: { kind: 'gap-bib', time: bibTime, bibTime, bib },
-    });
-  }
-
-  unpositioned.sort((a, b) => a.time - b.time);
-
-  let pos = 0;
-  return unpositioned.map((row) => {
-    if (!row.hasBib) return { key: row.key, position: null, data: row.data };
-    pos += 1;
-    return { key: row.key, position: pos, data: row.data };
-  });
-}
-
 // ── Screen ────────────────────────────────────────────────────────────────────
+
+type Sheet = { kind: 'edit'; target: EditTarget } | { kind: 'assign'; tap: CanonicalTap } | null;
 
 export default function ReviewScreen() {
   const { raceId } = useLocalSearchParams<{ raceId: string }>();
   const db = useSQLiteContext();
+  const router = useRouter();
   const deviceId = useRaceStore((s) => s.deviceId);
 
   const [race, setRace] = useState<Race | null>(null);
-  const [rows, setRows] = useState<ReviewRow[]>([]);
-  const [proposal, setProposal] = useState<Proposal>(EMPTY_PROPOSAL);
-  const [deviceActivity, setDeviceActivity] = useState<DeviceActivity[]>([]);
-  const [refreshing, setRefreshing] = useState(false);
+  const [event, setEvent] = useState<Event | null>(null);
+  const [taps, setTaps] = useState<Timestamp[]>([]);
+  const [finishes, setFinishes] = useState<Finish[]>([]);
+  const [participants, setParticipants] = useState<Participant[]>([]);
+  const [sheet, setSheet] = useState<Sheet>(null);
 
+  // Everything on this screen is derived from the raw rows of ALL devices
+  // (pulled from Supabase), not from whichever device this happens to be, so a
+  // third phone can watch results and fix bibs typed on another.
   const load = useCallback(async () => {
-    const r = await getRace(db, raceId);
-    setRace(r);
-    const [reviewRows, activity, nextProposal] = await Promise.all([
-      getReviewRows(db, raceId),
-      getDeviceActivity(db, raceId),
-      buildProposal(db, raceId, r?.start_time ?? null),
+    const [r, e, t, f, p] = await Promise.all([
+      getRace(db, raceId),
+      getEventForRace(db, raceId),
+      getTimestampsByRace(db, raceId),
+      getFinishesByRace(db, raceId),
+      getParticipantsByRace(db, raceId),
     ]);
-    setRows(reviewRows);
-    setDeviceActivity(activity);
-    setProposal(nextProposal);
+    setRace(r);
+    setEvent(e);
+    setTaps(t);
+    setFinishes(f);
+    setParticipants(p);
   }, [db, raceId]);
 
   useEffect(() => { load(); }, [load]);
 
-  const onRefresh = async () => {
-    setRefreshing(true);
+  // Live: push this device's edits, pull everyone else's, every few seconds.
+  const sync = useRaceSync(raceId, load);
+
+  const startTime = race?.start_time ?? null;
+  const view = useMemo(
+    () => buildResultsView({ taps, finishes, participants, startTime, thisDeviceId: deviceId }),
+    [taps, finishes, participants, startTime, deviceId],
+  );
+
+  const bibPositions = useMemo(() => {
+    const map = new Map<string, number[]>();
+    for (const row of view.rows) {
+      let bib: string | null = null;
+      if (row.kind === 'finisher') bib = row.finish.bib_number;
+      else if (row.kind === 'proposed') bib = row.pair.bib.bibNumber;
+      else if (row.kind === 'gap-bib') bib = row.bib.bibNumber;
+      else if (row.kind === 'disagreement') bib = row.entry.bibNumber;
+      if (bib && row.position !== null) map.set(bib, [...(map.get(bib) ?? []), row.position]);
+    }
+    return map;
+  }, [view.rows]);
+
+  const confidentPairs = view.proposal.pairs.filter((p) => !p.flagged);
+  const relinkPlan = useMemo(
+    () => planRelinkInOrder(view.model, startTime ?? 0),
+    [view.model, startTime],
+  );
+  const tapCount = view.model.clusters.length;
+  const bibCount = view.finishers.length;
+  const countsDiffer = tapCount > 0 && bibCount > 0 && tapCount !== bibCount;
+
+  // ── Edit actions (every one writes SQLite first, then syncs) ────────────────
+
+  const run = async (action: () => Promise<void>) => {
     try {
-      await pullRaceData(db, raceId);
+      await action();
     } catch (e) {
-      Alert.alert('Sync failed', e instanceof Error ? e.message : String(e));
+      Alert.alert('Could not save', e instanceof Error ? e.message : String(e));
     }
     await load();
-    setRefreshing(false);
+    sync.syncNow();
   };
 
-  // ── Derived ─────────────────────────────────────────────────────────────────
+  const handleSaveBib = (target: EditTarget, bib: string) => {
+    setSheet(null);
+    run(() => updateFinishBib(db, target.finishId, bib));
+  };
 
-  const confirmedRows = rows.filter((r) => r.finish_id !== null).sort((a, b) => (a.gun_time ?? 0) - (b.gun_time ?? 0));
-  const spreadsheetRows = buildSpreadsheetRows(rows, proposal, race?.start_time ?? null);
-  const confidentPairs = proposal.pairs.filter((p) => !p.flagged);
-  const finisherCount = spreadsheetRows.filter((r) => r.position !== null).length;
-  const needsReviewCount = spreadsheetRows.filter(
-    (r) => r.data.kind !== 'linked' || r.data.flagged,
-  ).length;
+  const handleRemoveEntry = (target: EditTarget) => {
+    Alert.alert(
+      `Remove bib ${target.bib}?`,
+      'The entry is taken out of the results. Its Timer tap stays, so it will show as a tap with no bib.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Remove',
+          style: 'destructive',
+          onPress: () => {
+            setSheet(null);
+            run(() => voidFinish(db, target.finishId));
+          },
+        },
+      ],
+    );
+  };
 
-  // ── Commit actions ────────────────────────────────────────────────────────
+  const discardTapIds = (tapIds: string[]) => run(async () => {
+    for (const id of tapIds) await voidTimestamp(db, id);
+  });
+
+  const handleDiscardTapForRow = (target: EditTarget) => {
+    if (!target.tapIds) return;
+    const ids = target.tapIds;
+    Alert.alert(
+      'Discard this tap?',
+      `Use this for a stray press with no runner. Bib ${target.bib} stays in the results but loses its time, then you can re-match bibs to taps in order.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Discard tap',
+          style: 'destructive',
+          onPress: () => {
+            setSheet(null);
+            discardTapIds(ids);
+          },
+        },
+      ],
+    );
+  };
+
+  const handleDiscardTap = (tap: CanonicalTap) => discardTapIds(tap.sourceIds);
+
+  // A finisher both Timers missed: add a tap halfway between the neighbouring
+  // finishers (or just before this one when it's first), then "re-match in
+  // order" slides the bibs onto the right times.
+  const handleInsertMissedTapBefore = (target: EditTarget) => {
+    if (!race?.start_time || !deviceId) return;
+    const start = race.start_time;
+    const earlier = view.rows
+      .filter((r) => r.position !== null && r.time < target.time)
+      .map((r) => r.time);
+    const prev = earlier.length > 0 ? Math.max(...earlier) : null;
+    const at = prev === null ? target.time - 1000 : Math.round((prev + target.time) / 2);
+    setSheet(null);
+    run(async () => {
+      await insertManualTimestamp(db, race.id, start + at, deviceId);
+    });
+  };
+
+  const handleAssignBibToTap = (tap: CanonicalTap, bibNumber: string) => {
+    if (!race?.start_time || !deviceId) return;
+    const start = race.start_time;
+    setSheet(null);
+    run(async () => {
+      await assignBibToTimestamp(db, race.id, bibNumber, tap.sourceIds[0], tap.time - start, deviceId);
+    });
+  };
 
   const commitPair = async (pair: ReconciledPair) => {
+    if (!race) return;
     const canonicalTapId = pair.tap.sourceIds[0];
     const canonicalFinishId = pair.bib.sourceIds[0];
-    const tapRow = proposal.tapById.get(canonicalTapId);
-    if (!tapRow || !race) return;
-    const gunTime = tapRow.recorded_at - (race.start_time ?? 0);
-    await linkFinishToTimestamp(db, canonicalFinishId, canonicalTapId, gunTime, pair.flagged);
-    for (const dupId of pair.tap.sourceIds.slice(1)) await markTimestampDuplicate(db, dupId, canonicalTapId);
+    await linkFinishToTimestamp(db, canonicalFinishId, canonicalTapId, pair.tap.time - (race.start_time ?? 0), pair.flagged);
     for (const dupId of pair.bib.sourceIds.slice(1)) await markFinishDuplicate(db, dupId, canonicalFinishId);
   };
 
-  const handleConfirmAllConfident = async () => {
-    for (const pair of confidentPairs) await commitPair(pair);
-    await load();
+  const handleConfirmAllConfident = () =>
+    run(async () => {
+      for (const pair of confidentPairs) await commitPair(pair);
+    });
+
+  const handleConfirmPair = (pair: ReconciledPair) => run(() => commitPair(pair));
+
+  const handleInsertTapForBib = (bib: CanonicalBibEntry) => {
+    if (!race || !deviceId) return;
+    const raceStart = race.start_time ?? 0;
+    run(async () => {
+      const recordedAt = Math.round(bib.time);
+      const ts = await insertManualTimestamp(db, race.id, recordedAt, deviceId);
+      await linkFinishToTimestamp(db, bib.sourceIds[0], ts.id, recordedAt - raceStart, false);
+      for (const dupId of bib.sourceIds.slice(1)) await markFinishDuplicate(db, dupId, bib.sourceIds[0]);
+    });
   };
 
-  const handleConfirmPair = async (pair: ReconciledPair) => {
-    await commitPair(pair);
-    await load();
-  };
+  const handleMatchBibToTap = (bib: CanonicalBibEntry, tap: CanonicalTap) =>
+    run(() => commitPair({ tap, bib, flagged: false }));
 
-  const handleDiscardTap = async (tap: CanonicalTap) => {
-    for (const id of tap.sourceIds) await voidTimestamp(db, id);
-    await load();
-  };
-
-  const handleAssignBibToTap = async (tap: CanonicalTap, bibNumber: string) => {
-    if (!race?.start_time || !deviceId) return;
-    const canonicalId = tap.sourceIds[0];
-    const tapRow = proposal.tapById.get(canonicalId);
-    if (!tapRow) return;
-    await assignBibToTimestamp(db, race.id, bibNumber, tapRow, race.start_time, deviceId);
-    for (const dupId of tap.sourceIds.slice(1)) await markTimestampDuplicate(db, dupId, canonicalId);
-    await load();
-  };
-
-  const handleInsertTapForBib = async (bib: CanonicalBibEntry) => {
-    if (!race) return;
-    const canonicalFinishId = bib.sourceIds[0];
-    const recordedAt = Math.round(bib.time);
-    const ts = await insertManualTimestamp(db, race.id, recordedAt);
-    await linkFinishToTimestamp(db, canonicalFinishId, ts.id, recordedAt - (race.start_time ?? 0), false);
-    for (const dupId of bib.sourceIds.slice(1)) await markFinishDuplicate(db, dupId, canonicalFinishId);
-    await load();
-  };
-
-  const handleMatchBibToTap = async (bib: CanonicalBibEntry, tap: CanonicalTap) => {
-    await commitPair({ tap, bib, flagged: false });
-    await load();
-  };
-
-  const handleResolveDisagreement = async (entry: CanonicalBibEntry, chosenBibNumber: string) => {
-    const groups = [{ bibNumber: entry.bibNumber, sourceIds: entry.sourceIds }, ...(entry.disagreement ?? [])];
-    const winner = groups.find((g) => g.bibNumber === chosenBibNumber);
-    if (!winner) return;
-    const winnerId = winner.sourceIds[0];
-    for (const g of groups) {
-      for (const id of g.sourceIds) {
-        if (id !== winnerId) await markFinishDuplicate(db, id, winnerId);
+  const handleResolveDisagreement = (entry: CanonicalBibEntry, chosenBibNumber: string) =>
+    run(async () => {
+      const groups = [{ bibNumber: entry.bibNumber, sourceIds: entry.sourceIds }, ...(entry.disagreement ?? [])];
+      const winner = groups.find((g) => g.bibNumber === chosenBibNumber);
+      if (!winner) return;
+      const winnerId = winner.sourceIds[0];
+      for (const g of groups) {
+        for (const id of g.sourceIds) {
+          if (id !== winnerId) await markFinishDuplicate(db, id, winnerId);
+        }
       }
+    });
+
+  const handleRelink = () => {
+    if (!relinkPlan.ok) return;
+    const { links } = relinkPlan;
+    if (links.length === 0) {
+      Alert.alert('Already in order', 'Every bib is already matched to the tap in its place in the order.');
+      return;
     }
-    await load();
+    Alert.alert(
+      'Re-match bibs to taps in order?',
+      `The ${bibCount} bibs and ${tapCount} taps line up one to one. This moves ${links.length} bib${links.length === 1 ? '' : 's'} onto the tap in the same position in the order, keeping every bib number exactly as typed.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Re-match', onPress: () => run(() => relinkFinishes(db, links)) },
+      ],
+    );
   };
 
   const handleExport = async () => {
-    if (confirmedRows.length === 0) {
+    if (view.finishers.length === 0) {
       Alert.alert('Nothing to export', 'Assign some bibs first.');
       return;
     }
     try {
-      await exportCsv(race?.name ?? 'race', confirmedRows);
+      await exportCsv(race?.name ?? 'race', buildCsv(view.finishers, participants));
     } catch (e) {
       Alert.alert('Export failed', String(e));
     }
   };
+
+  // ── Sheet content ───────────────────────────────────────────────────────────
+
+  let sheetProps: React.ComponentProps<typeof BibEditSheet> | null = null;
+  if (sheet?.kind === 'edit') {
+    const t = sheet.target;
+    const actions: SheetAction[] = [];
+    if (t.tapIds) {
+      actions.push({ label: 'Missed tap before this', onPress: () => handleInsertMissedTapBefore(t) });
+      actions.push({ label: 'Discard tap', destructive: true, onPress: () => handleDiscardTapForRow(t) });
+    }
+    actions.push({ label: 'Remove entry', destructive: true, onPress: () => handleRemoveEntry(t) });
+    sheetProps = {
+      visible: true,
+      title: `Position ${t.position ?? '?'} at ${formatGunTimeTenths(t.time)}`,
+      subtitle: 'Correct the bib number for this finisher',
+      initialBib: t.bib,
+      participants,
+      bibPositions,
+      ownPosition: t.position,
+      actions,
+      onSave: (bib) => handleSaveBib(t, bib),
+      onCancel: () => setSheet(null),
+    };
+  } else if (sheet?.kind === 'assign') {
+    const tap = sheet.tap;
+    sheetProps = {
+      visible: true,
+      title: `Add a bib for the tap at ${formatGunTimeTenths(tap.time - (startTime ?? 0))}`,
+      initialBib: '',
+      saveLabel: 'Add bib',
+      participants,
+      bibPositions,
+      ownPosition: null,
+      onSave: (bib) => handleAssignBibToTap(tap, bib),
+      onCancel: () => setSheet(null),
+    };
+  }
+
+  const [refreshing, setRefreshing] = useState(false);
+  const onRefresh = async () => {
+    setRefreshing(true);
+    await sync.syncNow();
+    await load();
+    setRefreshing(false);
+  };
+
+  const finished = event?.status === 'finished';
 
   return (
     <>
@@ -354,28 +358,65 @@ export default function ReviewScreen() {
           headerStyle: { backgroundColor: '#0d0d0d' },
           headerTintColor: '#fff',
           headerRight: () => (
-            <Pressable onPress={handleExport} style={styles.exportBtn}>
-              <Text style={styles.exportBtnText}>Export CSV</Text>
-            </Pressable>
+            <View style={styles.headerButtons}>
+              <Pressable onPress={() => router.push(`/race/${raceId}/report`)} style={styles.headerBtn}>
+                <Text style={styles.headerBtnText}>Prizes</Text>
+              </Pressable>
+              <Pressable onPress={handleExport} style={styles.headerBtn}>
+                <Text style={styles.headerBtnText}>Export CSV</Text>
+              </Pressable>
+            </View>
           ),
         }}
       />
 
       <FlatList
         style={styles.list}
-        data={spreadsheetRows}
+        data={view.rows}
         keyExtractor={(item) => item.key}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#fff" />}
         ListHeaderComponent={
           <View>
             <View style={styles.summary}>
               <Text style={styles.summaryText}>
-                {finisherCount} {finisherCount === 1 ? 'finisher' : 'finishers'}
+                {bibCount} {bibCount === 1 ? 'finisher' : 'finishers'}
               </Text>
-              {needsReviewCount > 0 && (
-                <Text style={styles.summaryGaps}>{needsReviewCount} need review</Text>
-              )}
+              {view.needsReview > 0 && <Text style={styles.summaryGaps}>{view.needsReview} need review</Text>}
+              <Text style={styles.syncStatus} numberOfLines={1}>
+                {finished ? 'Race finished' : sync.configured ? (sync.error ? 'Sync problem' : sync.online ? 'Live' : 'Offline') : 'This device only'}
+              </Text>
             </View>
+
+            {sync.error ? <Text style={styles.syncError}>{sync.error}</Text> : null}
+
+            <DeviceActivityStrip devices={view.devices} />
+
+            {view.timerDevices > 1 && (
+              <Text style={styles.caption}>
+                Taps within {(TAP_CLUSTER_WINDOW_MS / 1000).toFixed(1)}s on different timers count as one finisher.
+                Timers that did not tap are struck through.
+              </Text>
+            )}
+
+            {countsDiffer && (
+              <View style={styles.countsBox}>
+                <Text style={styles.countsTitle}>
+                  {bibCount} bibs but {tapCount} taps
+                </Text>
+                <Text style={styles.countsText}>
+                  Discard stray taps or add missed ones until the numbers match, then bibs can be re-matched to taps in order.
+                </Text>
+              </View>
+            )}
+
+            {relinkPlan.ok && relinkPlan.links.length > 0 && (
+              <Pressable style={styles.relinkBtn} onPress={handleRelink}>
+                <Text style={styles.relinkBtnText}>
+                  Re-match {relinkPlan.links.length} bib{relinkPlan.links.length === 1 ? '' : 's'} to taps in order
+                </Text>
+              </Pressable>
+            )}
+
             {confidentPairs.length > 0 && (
               <Pressable style={styles.confirmAllBtn} onPress={handleConfirmAllConfident}>
                 <Text style={styles.confirmAllBtnText}>
@@ -385,25 +426,23 @@ export default function ReviewScreen() {
             )}
           </View>
         }
-        ListFooterComponent={<DeviceActivityStrip activity={deviceActivity} />}
-        ListEmptyComponent={
-          <Text style={styles.empty}>No results recorded yet.</Text>
-        }
+        ListEmptyComponent={<Text style={styles.empty}>No results recorded yet.</Text>}
         renderItem={({ item }) => (
-          <SpreadsheetRow
-            position={item.position}
-            data={item.data}
-            nearbyTaps={proposal.unmatchedTaps}
-            onConfirmPair={handleConfirmPair}
-            onUnlinkPair={load}
-            onAssignBibToTap={handleAssignBibToTap}
+          <ResultRowView
+            row={item}
+            nearbyTaps={view.proposal.unmatchedTaps}
+            onEdit={(target) => setSheet({ kind: 'edit', target })}
+            onAssignTap={(tap) => setSheet({ kind: 'assign', tap })}
             onDiscardTap={handleDiscardTap}
+            onConfirmPair={handleConfirmPair}
             onInsertTapForBib={handleInsertTapForBib}
             onMatchBibToTap={handleMatchBibToTap}
             onResolveDisagreement={handleResolveDisagreement}
           />
         )}
       />
+
+      {sheetProps && <BibEditSheet {...sheetProps} />}
     </>
   );
 }
@@ -434,6 +473,59 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '600',
   },
+  syncStatus: {
+    flex: 1,
+    textAlign: 'right',
+    color: '#4caf50',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  syncError: {
+    color: '#f59e0b',
+    fontSize: 12,
+    paddingHorizontal: 16,
+    paddingTop: 8,
+  },
+  caption: {
+    color: '#555',
+    fontSize: 11,
+    paddingHorizontal: 16,
+    paddingBottom: 6,
+  },
+  countsBox: {
+    marginHorizontal: 16,
+    marginTop: 6,
+    marginBottom: 8,
+    backgroundColor: '#1a1400',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#5c4a10',
+    padding: 12,
+    gap: 4,
+  },
+  countsTitle: {
+    color: '#f59e0b',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  countsText: {
+    color: '#a78a3a',
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  relinkBtn: {
+    marginHorizontal: 16,
+    marginBottom: 8,
+    backgroundColor: '#1a237e',
+    borderRadius: 12,
+    padding: 14,
+    alignItems: 'center',
+  },
+  relinkBtnText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
   confirmAllBtn: {
     marginHorizontal: 16,
     marginBottom: 8,
@@ -453,14 +545,18 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginTop: 60,
   },
-  exportBtn: {
+  headerButtons: {
+    flexDirection: 'row',
+    gap: 8,
     marginRight: 4,
+  },
+  headerBtn: {
     paddingHorizontal: 12,
     paddingVertical: 6,
     backgroundColor: '#1b5e20',
     borderRadius: 8,
   },
-  exportBtnText: {
+  headerBtnText: {
     color: '#fff',
     fontSize: 14,
     fontWeight: '600',

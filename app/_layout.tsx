@@ -36,6 +36,7 @@ export default function RootLayout() {
               <Stack.Screen name="race/[raceId]/timer" options={{ headerShown: false }} />
               <Stack.Screen name="race/[raceId]/bib" options={{ headerShown: false }} />
             <Stack.Screen name="race/[raceId]/review" options={{ headerShown: true }} />
+            <Stack.Screen name="race/[raceId]/report" options={{ headerShown: true }} />
             <Stack.Screen name="race/[raceId]/participants" options={{ headerShown: true }} />
             </Stack>
             <StatusBar style="auto" />

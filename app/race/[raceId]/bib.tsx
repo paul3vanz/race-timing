@@ -3,13 +3,14 @@ import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { Stack, useLocalSearchParams } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Alert, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 import { Numpad } from '@/components/numpad';
 import { useRaceStartPoll } from '@/hooks/use-race-start-poll';
+import { useRaceSync } from '@/hooks/use-race-sync';
 import { participantDisplayName } from '@/lib/db';
+import { isActiveFinish, isActiveTap, isManualDevice } from '@/lib/merge';
 import { useRaceStore } from '@/lib/store';
-import { pullRaceData } from '@/lib/sync';
 
 // Fallback used before race data is loaded
 const DEFAULT_BIB_DIGITS = 3;
@@ -40,19 +41,30 @@ export default function BibScreen() {
   const db = useSQLiteContext();
 
   const activeRace = useRaceStore((s) => s.activeRace);
+  const event = useRaceStore((s) => s.event);
+  const timestamps = useRaceStore((s) => s.timestamps);
   const unassigned = useRaceStore((s) => s.unassigned);
+  const entryStack = useRaceStore((s) => s.entryStack);
   const finishes = useRaceStore((s) => s.finishes);
   const participants = useRaceStore((s) => s.participants);
   const loadRace = useRaceStore((s) => s.loadRace);
   const clearActiveRace = useRaceStore((s) => s.clearActiveRace);
   const startRace = useRaceStore((s) => s.startRace);
   const assignBib = useRaceStore((s) => s.assignBib);
+  const undoLastBib = useRaceStore((s) => s.undoLastBib);
+  const skipQueueHead = useRaceStore((s) => s.skipQueueHead);
   const refreshData = useRaceStore((s) => s.refreshData);
 
   useRaceStartPoll(raceId);
 
+  // The Timer phones' taps reach this device through Supabase, so keep pulling
+  // for as long as the screen is open. The queue is rebuilt from whatever has
+  // arrived; offline it just stays as it is and the bib entry carries on.
+  const sync = useRaceSync(raceId, () => refreshData(db));
+
   const [bib, setBib] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   // Tick every 30 s so the stale-timestamp warning refreshes without user input
   const [, setTick] = useState(0);
@@ -60,19 +72,12 @@ export default function BibScreen() {
   const clockRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
-    if (raceId) {
-      loadRace(db, raceId);
-      // One-shot pull so a standalone Bib device can see a separate Timer
-      // device's taps in its own queue, not just its own local writes.
-      pullRaceData(db, raceId)
-        .then(() => refreshData(db))
-        .catch(() => {});
-    }
-    activateKeepAwakeAsync();
+    if (raceId) loadRace(db, raceId);
+    activateKeepAwakeAsync().catch(() => {});
     tickRef.current = setInterval(() => setTick((t) => t + 1), 30_000);
     return () => {
       clearActiveRace();
-      deactivateKeepAwake();
+      deactivateKeepAwake().catch(() => {});
       if (tickRef.current) clearInterval(tickRef.current);
       if (clockRef.current) clearInterval(clockRef.current);
     };
@@ -90,7 +95,7 @@ export default function BibScreen() {
   // ── Input handling ──────────────────────────────────────────────────────────
 
   const handleDigit = (d: string) => {
-    if (submitting) return;
+    if (submitting || stopped) return;
     const next = bib + d;
     setBib(next);
     if (next.length >= bibDigits) {
@@ -110,10 +115,39 @@ export default function BibScreen() {
   const submit = async (bibNumber: string) => {
     if (!activeRace?.start_time) return;
     setSubmitting(true);
-    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    await assignBib(db, bibNumber);
-    setBib('');
-    setSubmitting(false);
+    // A bib that already has a result is accepted, not blocked: the operator
+    // keeps the queue moving and the Results screen flags both rows so the
+    // wrong one (usually transposed digits) can be corrected there.
+    const clash = finishes.find((f) => isActiveFinish(f) && f.bib_number === bibNumber);
+    try {
+      Haptics.notificationAsync(
+        clash ? Haptics.NotificationFeedbackType.Warning : Haptics.NotificationFeedbackType.Success,
+      );
+      await assignBib(db, bibNumber);
+      setNotice(clash ? `Bib ${bibNumber} was already entered. Both are flagged on Results.` : null);
+    } catch (e) {
+      setNotice(`Could not save bib ${bibNumber}: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      // Always release the numpad, whatever happened above.
+      setBib('');
+      setSubmitting(false);
+    }
+  };
+
+  const handleUndo = () => {
+    setNotice(null);
+    undoLastBib(db);
+  };
+
+  const handleSkipTap = () => {
+    Alert.alert(
+      'Skip this tap?',
+      'Use this when a Timer recorded a press with no runner (a stray tap). The finisher after it moves up. It can be fixed later on Results.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Skip tap', style: 'destructive', onPress: () => skipQueueHead(db) },
+      ],
+    );
   };
 
   // ── Derived display values ──────────────────────────────────────────────────
@@ -121,23 +155,30 @@ export default function BibScreen() {
   const current = unassigned[0] ?? null;
   const queueDepth = unassigned.length;
   const now = Date.now();
+  const stopped = event?.status === 'finished';
 
-  // Last 3 assigned bibs, most recent first
-  const recentFinishes = finishes.slice(-3).reverse();
+  // Last 3 assigned bibs (any device), most recent first
+  const activeFinishes = finishes.filter(isActiveFinish);
+  const recentFinishes = activeFinishes.slice(-3).reverse();
+
+  // How many Timer phones are feeding this race, so a tap only one of them
+  // caught can be called out in amber.
+  const timerCount = new Set(
+    timestamps.filter((t) => isActiveTap(t) && !isManualDevice(t.device_id)).map((t) => t.device_id),
+  ).size;
 
   const participantByBib = useMemo(
     () => new Map(participants.map((p) => [p.bib_number, p])),
     [participants],
   );
 
-  const isStale = current ? now - current.recorded_at > STALE_MS : false;
+  const isStale = current ? now - current.time > STALE_MS : false;
 
   const gunTime =
-    current && activeRace?.start_time
-      ? formatGunTime(current.recorded_at - activeRace.start_time)
-      : null;
+    current && activeRace?.start_time ? formatGunTime(current.time - activeRace.start_time) : null;
+  const partialCapture = current !== null && timerCount > 1 && current.deviceIds.length < timerCount;
 
-  const waiting = !activeRace?.start_time;
+  const waiting = !activeRace?.start_time || stopped;
   const bibDigits = activeRace ? activeRace.max_bib.toString().length : DEFAULT_BIB_DIGITS;
 
   // ── Render ──────────────────────────────────────────────────────────────────
@@ -164,14 +205,23 @@ export default function BibScreen() {
                   <Text style={styles.startBtnText}>Start Race</Text>
                 </Pressable>
               </View>
+            ) : stopped ? (
+              <Text style={styles.waiting}>Race stopped. Reopen it from the Races list to keep entering bibs.</Text>
             ) : current ? (
               <>
                 <Text style={[styles.seq, isStale && styles.textStale]}>
-                  Finisher #{current.sequence_num}
+                  Finisher #{current.position}
                 </Text>
                 <Text style={[styles.gunTime, isStale && styles.textStale]}>
                   {gunTime}
                 </Text>
+                {timerCount > 1 && (
+                  <Text style={partialCapture ? styles.staleWarning : styles.queue}>
+                    {partialCapture
+                      ? `Only ${current.deviceIds.length} of ${timerCount} timers caught this one`
+                      : `Caught by all ${timerCount} timers`}
+                  </Text>
+                )}
                 {queueDepth > 1 && (
                   <Text style={styles.queue}>
                     {queueDepth - 1} more waiting
@@ -179,7 +229,7 @@ export default function BibScreen() {
                 )}
                 {isStale && (
                   <Text style={styles.staleWarning}>
-                    No bib for {Math.floor((now - current.recorded_at) / 60_000)} min — check finish order
+                    No bib for {Math.floor((now - current.time) / 60_000)} min, check finish order
                   </Text>
                 )}
               </>
@@ -187,16 +237,44 @@ export default function BibScreen() {
               <>
                 <Text style={styles.seq}>Live entry</Text>
                 <Text style={styles.gunTime}>{formatGunTime(elapsed)}</Text>
-                <Text style={styles.queue}>Type bib as each finisher crosses</Text>
+                <Text style={styles.queue}>
+                  {timerCount > 0
+                    ? 'No taps waiting. Bibs typed now are matched to taps on Results.'
+                    : 'Type bib as each finisher crosses'}
+                </Text>
               </>
             )}
           </View>
+
+          {/* ── Queue tools + sync status ── */}
+          <View style={styles.toolsRow}>
+            {current && !stopped && (
+              <Pressable style={styles.toolBtn} onPress={handleSkipTap} hitSlop={6}>
+                <Text style={styles.toolBtnText}>Skip stray tap</Text>
+              </Pressable>
+            )}
+            {entryStack.length > 0 && (
+              <Pressable style={styles.toolBtn} onPress={handleUndo} hitSlop={6}>
+                <Text style={styles.toolBtnText}>Undo last bib</Text>
+              </Pressable>
+            )}
+            <Text style={[styles.syncText, sync.error ? styles.syncTextError : null]} numberOfLines={1}>
+              {!sync.configured
+                ? 'Local only'
+                : sync.error
+                  ? `Sync problem: ${sync.error}`
+                  : !sync.online
+                    ? 'Offline, keeps working'
+                    : 'Live'}
+            </Text>
+          </View>
+          {notice && <Text style={styles.notice}>{notice}</Text>}
 
           {/* ── Recent entries ── */}
           {recentFinishes.length > 0 && (
             <View style={styles.recent}>
               {recentFinishes.map((f) => {
-                const pos = finishes.indexOf(f) + 1;
+                const pos = activeFinishes.indexOf(f) + 1;
                 const participant = participantByBib.get(f.bib_number);
                 return (
                   <View key={f.id} style={styles.recentRow}>
@@ -341,6 +419,38 @@ const styles = StyleSheet.create({
     fontFamily: mono,
     fontSize: 36,
     fontWeight: '700',
+  },
+  toolsRow: {
+    marginHorizontal: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  toolBtn: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#333',
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+  },
+  toolBtnText: {
+    color: '#aaa',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  syncText: {
+    flex: 1,
+    textAlign: 'right',
+    color: '#444',
+    fontSize: 11,
+  },
+  syncTextError: {
+    color: '#f59e0b',
+  },
+  notice: {
+    marginHorizontal: 16,
+    color: '#f59e0b',
+    fontSize: 13,
   },
   recent: {
     marginHorizontal: 16,

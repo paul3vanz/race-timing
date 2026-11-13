@@ -54,7 +54,7 @@ export interface CanonicalBibEntry {
 // pair of very-close real finishers to land in separate clusters here — that
 // ambiguity gets resolved in phase 2 by cross-referencing the Bib stream,
 // not guessed at in isolation.
-const TAP_CLUSTER_WINDOW_MS = 1500;
+export const TAP_CLUSTER_WINDOW_MS = 1500;
 
 // Bib entries are typed, not tapped, so allow more jitter between devices —
 // two operators glancing at the same runner and keying in a number won't be
@@ -91,8 +91,11 @@ function clusterByDeviceUniqueTime<T extends { deviceId: string; time: number }>
   return clusters;
 }
 
-export function clusterTimerTaps(rawTaps: RawTap[]): CanonicalTap[] {
-  return clusterByDeviceUniqueTime(rawTaps, TAP_CLUSTER_WINDOW_MS).map((cluster) => ({
+export function clusterTimerTaps(
+  rawTaps: RawTap[],
+  windowMs: number = TAP_CLUSTER_WINDOW_MS,
+): CanonicalTap[] {
+  return clusterByDeviceUniqueTime(rawTaps, windowMs).map((cluster) => ({
     time: median(cluster.map((t) => t.time)),
     sourceIds: cluster.map((t) => t.id),
     corroboration: cluster.length,
