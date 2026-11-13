@@ -3,6 +3,12 @@
 -- Supabase's hosted platform — the API gateway only accepts registered keys
 -- (anon/service_role), so that role was unreachable regardless of RLS.
 -- Guarded on existence since that migration may never have been pushed.
+-- The policies must go first: a role can't be dropped while policies target it.
+drop policy if exists "live_results_reader read - events"       on events;
+drop policy if exists "live_results_reader read - races"        on races;
+drop policy if exists "live_results_reader read - participants" on participants;
+drop policy if exists "live_results_reader read - finishes"     on finishes;
+
 do $$
 begin
   if exists (select from pg_roles where rolname = 'live_results_reader') then
@@ -13,11 +19,6 @@ begin
   end if;
 end
 $$;
-
-drop policy if exists "live_results_reader read - events"       on events;
-drop policy if exists "live_results_reader read - races"        on races;
-drop policy if exists "live_results_reader read - participants" on participants;
-drop policy if exists "live_results_reader read - finishes"     on finishes;
 
 -- ── Read/write split by role instead of by key ──────────────────────────────
 -- `anon` (the black-pear-joggers CMS's live-results page, and the mobile app
