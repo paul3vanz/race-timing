@@ -45,6 +45,8 @@ export default function BibScreen() {
   const timestamps = useRaceStore((s) => s.timestamps);
   const unassigned = useRaceStore((s) => s.unassigned);
   const entryStack = useRaceStore((s) => s.entryStack);
+  const bibMode = useRaceStore((s) => s.bibMode);
+  const setBibMode = useRaceStore((s) => s.setBibMode);
   const finishes = useRaceStore((s) => s.finishes);
   const participants = useRaceStore((s) => s.participants);
   const loadRace = useRaceStore((s) => s.loadRace);
@@ -118,13 +120,21 @@ export default function BibScreen() {
     // A bib that already has a result is accepted, not blocked: the operator
     // keeps the queue moving and the Results screen flags both rows so the
     // wrong one (usually transposed digits) can be corrected there.
-    const clash = finishes.find((f) => isActiveFinish(f) && f.bib_number === bibNumber);
+    const clash = finishes.find(
+      (f) => isActiveFinish(f) && f.bib_number === bibNumber && f.source === (lineMode ? 'line' : 'funnel'),
+    );
     try {
       Haptics.notificationAsync(
         clash ? Haptics.NotificationFeedbackType.Warning : Haptics.NotificationFeedbackType.Success,
       );
       await assignBib(db, bibNumber);
-      setNotice(clash ? `Bib ${bibNumber} was already entered. Both are flagged on Results.` : null);
+      setNotice(
+        clash
+          ? lineMode
+            ? `Bib ${bibNumber} was already entered at the finish line.`
+            : `Bib ${bibNumber} was already entered. Both are flagged on Results.`
+          : null,
+      );
     } catch (e) {
       setNotice(`Could not save bib ${bibNumber}: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -137,6 +147,20 @@ export default function BibScreen() {
   const handleUndo = () => {
     setNotice(null);
     undoLastBib(db);
+  };
+
+  const handleChangeMode = () => {
+    const target = lineMode ? 'funnel' : 'line';
+    Alert.alert(
+      target === 'line' ? 'Switch to finish line mode?' : 'Switch to funnel mode?',
+      target === 'line'
+        ? 'Use this when you are a backup recorder at the finish line typing the bibs you can catch. Entries are timed as you type and used to cross-check the timers. They are not the official results.'
+        : 'Use this for the complete list typed at the end of the funnel. Entries are matched to the timers\' taps in order.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: target === 'line' ? 'Finish line mode' : 'Funnel mode', onPress: () => setBibMode(target) },
+      ],
+    );
   };
 
   const handleSkipTap = () => {
@@ -152,13 +176,17 @@ export default function BibScreen() {
 
   // ── Derived display values ──────────────────────────────────────────────────
 
-  const current = unassigned[0] ?? null;
+  const lineMode = bibMode === 'line';
+  // Finish-line mode never works from the tap queue.
+  const current = lineMode ? null : unassigned[0] ?? null;
   const queueDepth = unassigned.length;
   const now = Date.now();
   const stopped = event?.status === 'finished';
 
-  // Last 3 assigned bibs (any device), most recent first
-  const activeFinishes = finishes.filter(isActiveFinish);
+  // Last 3 entries of the kind this device records (any device), most recent first
+  const activeFinishes = finishes.filter(
+    (f) => isActiveFinish(f) && (lineMode ? f.source === 'line' : f.source !== 'line'),
+  );
   const recentFinishes = activeFinishes.slice(-3).reverse();
 
   // How many Timer phones are feeding this race, so a tap only one of them
@@ -235,12 +263,14 @@ export default function BibScreen() {
               </>
             ) : (
               <>
-                <Text style={styles.seq}>Live entry</Text>
+                <Text style={styles.seq}>{lineMode ? 'Finish line mode' : 'Live entry'}</Text>
                 <Text style={styles.gunTime}>{formatGunTime(elapsed)}</Text>
                 <Text style={styles.queue}>
-                  {timerCount > 0
-                    ? 'No taps waiting. Bibs typed now are matched to taps on Results.'
-                    : 'Type bib as each finisher crosses'}
+                  {lineMode
+                    ? 'Type the bibs you catch as runners cross. Used to cross-check the timers.'
+                    : timerCount > 0
+                      ? 'No taps waiting. Bibs typed now are matched to taps on Results.'
+                      : 'Type bib as each finisher crosses'}
                 </Text>
               </>
             )}
@@ -248,6 +278,11 @@ export default function BibScreen() {
 
           {/* ── Queue tools + sync status ── */}
           <View style={styles.toolsRow}>
+            <Pressable style={[styles.toolBtn, lineMode && styles.toolBtnActive]} onPress={handleChangeMode} hitSlop={6}>
+              <Text style={[styles.toolBtnText, lineMode && styles.toolBtnTextActive]}>
+                {lineMode ? 'Mode: finish line' : 'Mode: funnel'}
+              </Text>
+            </Pressable>
             {current && !stopped && (
               <Pressable style={styles.toolBtn} onPress={handleSkipTap} hitSlop={6}>
                 <Text style={styles.toolBtnText}>Skip stray tap</Text>
@@ -437,6 +472,13 @@ const styles = StyleSheet.create({
     color: '#aaa',
     fontSize: 12,
     fontWeight: '600',
+  },
+  toolBtnActive: {
+    borderColor: '#1a237e',
+    backgroundColor: '#10153d',
+  },
+  toolBtnTextActive: {
+    color: '#9fa8ff',
   },
   syncText: {
     flex: 1,

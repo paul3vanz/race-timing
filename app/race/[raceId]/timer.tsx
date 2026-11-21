@@ -4,6 +4,7 @@ import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { useRaceStartPoll } from '@/hooks/use-race-start-poll';
 import { useVolumeKeyTap } from '@/hooks/use-volume-key-tap';
@@ -33,6 +34,7 @@ export default function TimerScreen() {
   const { raceId } = useLocalSearchParams<{ raceId: string }>();
   const db = useSQLiteContext();
   const router = useRouter();
+  const insets = useSafeAreaInsets();
 
   const activeRace = useRaceStore((s) => s.activeRace);
   const event = useRaceStore((s) => s.event);
@@ -152,7 +154,7 @@ export default function TimerScreen() {
     <>
       <Stack.Screen options={{ headerShown: false }} />
       <Pressable
-        style={[styles.container, flash && styles.flash]}
+        style={[styles.container, { paddingBottom: 32 + insets.bottom }, flash && styles.flash]}
         onPress={canTap ? () => handleTap() : undefined}
         android_disableSound
       >

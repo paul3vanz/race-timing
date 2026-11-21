@@ -2,7 +2,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import { File } from 'expo-file-system';
 import { Stack, useLocalSearchParams } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   Alert,
   FlatList,
@@ -17,6 +17,9 @@ import {
   View,
 } from 'react-native';
 
+import { SafeAreaProvider, useSafeAreaInsets, type EdgeInsets } from 'react-native-safe-area-context';
+
+import { ParticipantSheet, type EntrantFields } from '@/components/participant-sheet';
 import {
   buildParticipants,
   type ColumnMapping,
@@ -35,6 +38,8 @@ import {
   getRace,
   participantDisplayName as displayName,
   setRaceMaxBib,
+  updateParticipantDetails,
+  upsertParticipant,
   type Participant,
   type Race,
 } from '@/lib/db';
@@ -60,11 +65,27 @@ const CSV_MIME_TYPES = [
   'text/plain',
 ];
 
+// A Modal is its own window on Android, so it needs its own SafeAreaProvider
+// before it can read the system bar insets (status bar, gesture/nav bar).
+function WithInsets({ render }: { render: (insets: EdgeInsets) => ReactNode }) {
+  const insets = useSafeAreaInsets();
+  return <>{render(insets)}</>;
+}
+
+const distinctSorted = (values: (string | null)[]): string[] =>
+  [...new Set(values.filter((v): v is string => Boolean(v)))].sort((a, b) =>
+    a.localeCompare(b, undefined, { numeric: true }),
+  );
+
+type EntrantSheet = { mode: 'add'; initial: null } | { mode: 'edit'; initial: EntrantFields; id: string };
+
 // ── Screen ────────────────────────────────────────────────────────────────────
 
 export default function ParticipantsScreen() {
   const { raceId } = useLocalSearchParams<{ raceId: string }>();
   const db = useSQLiteContext();
+  const insets = useSafeAreaInsets();
+  const [entrantSheet, setEntrantSheet] = useState<EntrantSheet | null>(null);
 
   const [race, setRace] = useState<Race | null>(null);
   const [participants, setParticipants] = useState<Participant[]>([]);
@@ -173,6 +194,44 @@ export default function ParticipantsScreen() {
     }
   };
 
+  // ── Add / edit a single entrant ────────────────────────────────────────────────
+
+  const suggestedBib = useMemo(() => {
+    const numeric = participants.map((p) => parseInt(p.bib_number, 10)).filter((n) => !Number.isNaN(n));
+    return String((numeric.length > 0 ? Math.max(...numeric) : 0) + 1);
+  }, [participants]);
+  const categories = useMemo(() => distinctSorted(participants.map((p) => p.category)), [participants]);
+  const subCategories = useMemo(() => distinctSorted(participants.map((p) => p.sub_category)), [participants]);
+
+  // Resolves to an error message for the sheet to show, or null once saved.
+  const handleSaveEntrant = async (fields: EntrantFields): Promise<string | null> => {
+    if (!entrantSheet) return null;
+    try {
+      if (!(fields.first_name || fields.last_name || fields.team_name)) {
+        return 'Add a first or last name, or a team name.';
+      }
+      if (entrantSheet.mode === 'edit') {
+        await updateParticipantDetails(db, entrantSheet.id, fields);
+      } else {
+        if (!fields.bib_number) return 'Enter a bib number.';
+        const clash = participants.find((p) => p.bib_number === fields.bib_number);
+        if (clash) {
+          return `Bib ${fields.bib_number} already belongs to ${displayName(clash)}. Tap that entry to edit it instead.`;
+        }
+        await upsertParticipant(db, { race_id: raceId, ...fields });
+        // The Bib screen sizes its digit boxes (and auto-submit) from the
+        // highest expected bib, so a late entry above it has to raise it.
+        const n = parseInt(fields.bib_number, 10);
+        if (race && !Number.isNaN(n) && n > race.max_bib) await setRaceMaxBib(db, raceId, n);
+      }
+      await load();
+      setEntrantSheet(null);
+      return null;
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+  };
+
   const handleClearAll = async () => {
     setConfirmingClear(false);
     await deleteParticipantsByRace(db, raceId);
@@ -195,23 +254,51 @@ export default function ParticipantsScreen() {
         style={styles.list}
         data={participants}
         keyExtractor={(p) => p.id}
+        // The Android nav bar / gesture area sits over the bottom of the screen,
+        // so the last rows and the Clear buttons need to clear it.
+        contentContainerStyle={{ paddingBottom: insets.bottom + 24 }}
+        keyboardShouldPersistTaps="handled"
         ListHeaderComponent={
           <View style={styles.header}>
             <Text style={styles.count}>
               {participants.length} participant{participants.length === 1 ? '' : 's'}
             </Text>
-            <Pressable style={styles.importBtn} onPress={handlePickFile}>
-              <Text style={styles.importBtnText}>Import CSV</Text>
-            </Pressable>
+            <View style={styles.headerButtons}>
+              <Pressable style={styles.addBtn} onPress={() => setEntrantSheet({ mode: 'add', initial: null })}>
+                <Text style={styles.importBtnText}>+ Add</Text>
+              </Pressable>
+              <Pressable style={styles.importBtn} onPress={handlePickFile}>
+                <Text style={styles.importBtnText}>Import CSV</Text>
+              </Pressable>
+            </View>
           </View>
         }
         ListEmptyComponent={
           <Text style={styles.empty}>
-            No participants loaded yet.{'\n'}Import a CSV to get started.
+            No participants loaded yet.{'\n'}Import a CSV or tap + Add to get started.
           </Text>
         }
         renderItem={({ item }) => (
-          <View style={styles.row}>
+          <Pressable
+            style={styles.row}
+            onPress={() =>
+              setEntrantSheet({
+                mode: 'edit',
+                id: item.id,
+                initial: {
+                  bib_number: item.bib_number,
+                  first_name: item.first_name,
+                  last_name: item.last_name,
+                  gender: item.gender,
+                  dob: item.dob,
+                  club: item.club,
+                  category: item.category,
+                  team_name: item.team_name,
+                  sub_category: item.sub_category,
+                },
+              })
+            }
+          >
             <Text style={styles.bib}>{item.bib_number}</Text>
             <View style={styles.rowInfo}>
               <Text style={styles.name}>{displayName(item)}</Text>
@@ -221,7 +308,8 @@ export default function ParticipantsScreen() {
                 </Text>
               )}
             </View>
-          </View>
+            <Text style={styles.editHint}>edit</Text>
+          </Pressable>
         )}
         ListFooterComponent={
           participants.length > 0 ? (
@@ -248,7 +336,10 @@ export default function ParticipantsScreen() {
 
       {/* ── Column mapping modal ── */}
       <Modal visible={parsed !== null} animationType="slide" onRequestClose={closeImport}>
-        <View style={styles.modalRoot}>
+        <SafeAreaProvider>
+          <WithInsets
+            render={(modalInsets) => (
+        <View style={[styles.modalRoot, { paddingTop: modalInsets.top }]}>
           <View style={styles.modalHeader}>
             <Text style={styles.modalTitle}>Map CSV Columns</Text>
             <Text style={styles.modalSubtitle}>
@@ -332,7 +423,7 @@ export default function ParticipantsScreen() {
             )}
           </ScrollView>
 
-          <View style={styles.modalFooter}>
+          <View style={[styles.modalFooter, { paddingBottom: 16 + modalInsets.bottom }]}>
             <Pressable style={styles.btnCancel} onPress={closeImport} disabled={importing}>
               <Text style={styles.btnCancelText}>Cancel</Text>
             </Pressable>
@@ -347,7 +438,22 @@ export default function ParticipantsScreen() {
             </Pressable>
           </View>
         </View>
+            )}
+          />
+        </SafeAreaProvider>
       </Modal>
+
+      {/* ── Add / edit one entrant ── */}
+      <ParticipantSheet
+        visible={entrantSheet !== null}
+        mode={entrantSheet?.mode ?? 'add'}
+        initial={entrantSheet?.initial ?? null}
+        suggestedBib={suggestedBib}
+        categories={categories}
+        subCategories={subCategories}
+        onSave={handleSaveEntrant}
+        onCancel={() => setEntrantSheet(null)}
+      />
     </>
   );
 }
@@ -405,6 +511,20 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 17,
     fontWeight: '600',
+  },
+  headerButtons: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  addBtn: {
+    backgroundColor: '#1a237e',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 10,
+  },
+  editHint: {
+    color: '#444',
+    fontSize: 12,
   },
   importBtn: {
     backgroundColor: '#1b5e20',

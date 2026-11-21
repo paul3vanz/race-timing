@@ -64,6 +64,9 @@ export function ResultRowView({
   // ── Finisher (confirmed) ────────────────────────────────────────────────────
   if (row.kind === 'finisher') {
     const problems = flagLines(row.flags, row.extraEntries);
+    if (row.line?.status === 'disagrees') {
+      problems.push(`Finish line recorded this bib ${describeDelta(row.line.deltaMs)}, check its tap`);
+    }
     return (
       <Pressable
         style={[styles.row, problems.length > 0 && styles.rowFlagged]}
@@ -91,6 +94,7 @@ export function ResultRowView({
             {row.deviceLabels.map((d) => (
               <Text key={d} style={styles.chip}>{d}</Text>
             ))}
+            {row.line?.status === 'agrees' && <Text style={styles.chip}>line ✓</Text>}
             {row.flags.missingTimers.map((d) => (
               <Text key={`m-${d}`} style={[styles.chip, styles.chipMissing]}>{d}</Text>
             ))}
@@ -123,7 +127,9 @@ export function ResultRowView({
         >
           <Text style={styles.bibCell}>{row.pair.bib.bibNumber}</Text>
           {row.name ? <Text style={styles.name} numberOfLines={1}>{row.name}</Text> : null}
-          <Text style={styles.pendingSub}>typed {formatGunTime(row.bibTime)} (gap {Math.round(gapMs / 1000)}s)</Text>
+          <Text style={styles.pendingSub}>
+            {row.fromLine ? 'finish line' : 'typed'} {formatGunTime(row.bibTime)} (gap {Math.round(gapMs / 1000)}s)
+          </Text>
           {problems.map((p) => (
             <Text key={p} style={styles.problem}>{p}</Text>
           ))}
@@ -200,7 +206,9 @@ export function ResultRowView({
         }
       >
         <Text style={styles.bibCell}>{row.bib.bibNumber}</Text>
-        <Text style={styles.detail}>typed {formatGunTime(row.bibTime)}, no matching tap</Text>
+        <Text style={styles.detail}>
+          {row.fromLine ? 'finish line' : 'typed'} {formatGunTime(row.bibTime)}, no matching tap
+        </Text>
       </Pressable>
       <View style={styles.actions}>
         <Pressable style={styles.btnGhost} onPress={() => handleMatchManually(row.bib)}>
@@ -212,6 +220,11 @@ export function ResultRowView({
       </View>
     </View>
   );
+}
+
+function describeDelta(ms: number): string {
+  const secs = Math.round(Math.abs(ms) / 1000);
+  return `${secs}s ${ms >= 0 ? 'later' : 'earlier'} than the timers`;
 }
 
 function flagLines(flags: RowFlags, extraEntries: number): string[] {
@@ -234,7 +247,14 @@ export function DeviceActivityStrip({ devices }: { devices: DeviceSummary[] }) {
         <View key={d.deviceId} style={styles.diagnosticChip}>
           <Text style={styles.diagnosticDevice}>{d.label.long}</Text>
           <Text style={styles.diagnosticStat}>
-            {d.taps} {d.label.role === 'bib' ? (d.taps === 1 ? 'bib' : 'bibs') : d.taps === 1 ? 'tap' : 'taps'}
+            {d.taps}{' '}
+            {d.label.role === 'bib' || d.label.role === 'line'
+              ? d.taps === 1
+                ? 'bib'
+                : 'bibs'
+              : d.taps === 1
+                ? 'tap'
+                : 'taps'}
             {d.missed > 0 ? ` · missed ${d.missed}` : ''}
             {d.discarded > 0 ? ` · ${d.discarded} discarded` : ''}
           </Text>

@@ -38,6 +38,7 @@ function finish(bib: string, timestampId: string | null, gunTime: number, extra:
     flagged: 0,
     duplicate_of: null,
     voided: 0,
+    source: 'funnel',
     synced: 0,
     ...extra,
   };
@@ -248,5 +249,104 @@ describe('planRelinkInOrder', () => {
       expect(byFinish.has(finishes[0].id)).toBe(false);
       expect(byFinish.get(finishes[2].id)?.gunTime).toBe(30_000);
     }
+  });
+});
+
+// The race-day set-up: two Timers (no bibs), a backup recorder at the finish
+// line who types the bibs they can catch, and a funnel recorder with the
+// complete list typed some seconds after each crossing.
+describe('Timers + finish-line recorder + funnel recorder', () => {
+  const N = 10;
+  const bibOf = (i: number) => String(100 + i);
+
+  function raceDay() {
+    const { a, b } = twoTimerRace(N);
+    // Finisher i crosses at (i+1)*10s. Finish-line recorder types ~2s later.
+    const line = (indices: number[], extra: (i: number) => Partial<Finish> = () => ({})) =>
+      indices.map((i) =>
+        finish(bibOf(i), null, (i + 1) * 10_000 + 2_000, { device_id: 'mat', source: 'line', ...extra(i) }),
+      );
+    return { a, b, line };
+  }
+
+  test('funnel list linked at entry; a partial finish-line list agrees and adds no rows', () => {
+    const { a, b, line } = raceDay();
+    const jo = a.map((t, i) => finish(bibOf(i), t.id, (i + 1) * 10_000 + 150, { device_id: 'jo' }));
+    const v = view([...a, ...b], [...jo, ...line([0, 1, 2, 4, 7])]);
+
+    expect(v.rows.filter((r) => r.kind === 'finisher')).toHaveLength(N);
+    expect(v.rows.some((r) => r.kind === 'gap-bib' || r.kind === 'proposed')).toBe(false);
+    const checked = v.rows.filter((r) => r.kind === 'finisher' && r.line !== null);
+    expect(checked).toHaveLength(5);
+    expect(checked.every((r) => r.kind === 'finisher' && r.line?.status === 'agrees')).toBe(true);
+    expect(v.needsReview).toBe(0);
+    expect(v.finishers).toHaveLength(N);
+
+    expect(v.labels.get('mat')?.short).toBe('L1');
+    expect(v.labels.get('mat')?.role).toBe('line');
+    expect(v.labels.get('jo')?.short).toBe('B1');
+  });
+
+  test('a bib the funnel linked to the wrong tap is caught by the finish-line time', () => {
+    const { a, b, line } = raceDay();
+    const jo = a.map((t, i) => finish(bibOf(i), t.id, (i + 1) * 10_000, { device_id: 'jo' }));
+    // Funnel recorder's entries 4 and 5 swapped taps (bib 104 got finisher 6's tap).
+    jo[4] = { ...jo[4], timestamp_id: a[5].id };
+    const v = view([...a, ...b], [...jo, ...line([4])]);
+    const bad = v.rows.find((r) => r.kind === 'finisher' && r.finish.bib_number === bibOf(4));
+    expect(bad?.kind === 'finisher' && bad.line?.status).toBe('disagrees');
+    expect(bad?.kind === 'finisher' && bad.line && bad.line.deltaMs).toBeLessThan(0);
+    expect(v.needsReview).toBeGreaterThanOrEqual(1);
+  });
+
+  test('a runner the funnel missed is recovered from the finish-line list and the leftover tap', () => {
+    const { a, b, line } = raceDay();
+    const jo = a
+      .map((t, i) => finish(bibOf(i), t.id, (i + 1) * 10_000, { device_id: 'jo' }))
+      .filter((_, i) => i !== 6); // funnel never typed finisher 7
+    const v = view([...a, ...b], [...jo, ...line([3, 6])]);
+
+    const proposed = v.rows.filter((r) => r.kind === 'proposed');
+    expect(proposed).toHaveLength(1);
+    expect(proposed[0].kind === 'proposed' && proposed[0].pair.bib.bibNumber).toBe(bibOf(6));
+    expect(proposed[0].kind === 'proposed' && proposed[0].fromLine).toBe(true);
+    // The tap now has a home, so there is no orphan tap and no stray bib row.
+    expect(v.rows.some((r) => r.kind === 'gap-tap' || r.kind === 'gap-bib')).toBe(false);
+  });
+
+  test('a finish-line bib with no tap and no funnel entry is a gap, not a result', () => {
+    const { a, b, line } = raceDay();
+    const jo = a.map((t, i) => finish(bibOf(i), t.id, (i + 1) * 10_000, { device_id: 'jo' }));
+    const stray = finish('555', null, 400_000, { device_id: 'mat', source: 'line' });
+    const v = view([...a, ...b], [...jo, ...line([0]), stray]);
+    const gap = v.rows.find((r) => r.kind === 'gap-bib');
+    expect(gap?.kind === 'gap-bib' && gap.bib.bibNumber).toBe('555');
+    expect(gap?.kind === 'gap-bib' && gap.fromLine).toBe(true);
+    expect(v.finishers.map((f) => f.bib)).not.toContain('555');
+  });
+
+  test('funnel list typed offline (about 7s late) is matched to the taps; line duplicates are not proposed again', () => {
+    const { a, b, line } = raceDay();
+    const joOffline = a.map((t, i) => finish(bibOf(i), null, (i + 1) * 10_000 + 7_000, { device_id: 'jo' }));
+    const v = view([...a, ...b], [...joOffline, ...line([1, 2, 5])]);
+
+    const proposed = v.rows.filter((r) => r.kind === 'proposed');
+    expect(proposed).toHaveLength(N);
+    expect(proposed.every((r) => r.kind === 'proposed' && !r.fromLine)).toBe(true);
+    expect(v.rows.some((r) => r.kind === 'gap-bib' || r.kind === 'gap-tap')).toBe(false);
+    // Each bib lands on its own finisher's tap.
+    proposed.forEach((r, i) => {
+      expect(r.kind === 'proposed' && r.pair.bib.bibNumber).toBe(bibOf(i));
+    });
+  });
+
+  test('with no Timer taps at all the finish-line entries are the results', () => {
+    const entries = [
+      finish('7', null, 61_000, { device_id: 'mat', source: 'line' }),
+      finish('9', null, 65_000, { device_id: 'mat', source: 'line' }),
+    ];
+    const v = view([], entries);
+    expect(v.rows.map((r) => r.kind)).toEqual(['finisher', 'finisher']);
+    expect(v.finishers).toHaveLength(2);
   });
 });

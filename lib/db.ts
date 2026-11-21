@@ -68,6 +68,10 @@ export interface Finish {
   flagged: 0 | 1; // low-confidence auto-match from reconciliation, needs an eyeball
   duplicate_of: string | null; // set when a backup device's entry corroborates another finish row, not a separate finisher
   voided: 0 | 1; // operator removed this bib entry as a mistake — never deleted, so the removal syncs
+  // 'funnel' entries are the race's results (typed against the Timer queue, or later matched to it).
+  // 'line' entries are a backup recorder's partial list typed at the finish line: kept as evidence
+  // to cross-check the timers and fill gaps, never published as results on their own.
+  source: 'funnel' | 'line';
   synced: 0 | 1;
 }
 
@@ -229,6 +233,12 @@ const MIGRATIONS: string[] = [
   CREATE INDEX IF NOT EXISTS finishes_race_bib_idx ON finishes(race_id, bib_number);
   ALTER TABLE finishes ADD COLUMN voided INTEGER NOT NULL DEFAULT 0;
   `,
+
+  // v10 — finishes.source. A second Bib device can stand at the finish line and
+  // type the bibs it can catch, recording the time typed. Those entries are a
+  // partial cross-check of the Timer taps, not a second set of results, so they
+  // need to be told apart from the funnel recorder's complete list.
+  `ALTER TABLE finishes ADD COLUMN source TEXT NOT NULL DEFAULT 'funnel';`,
 ];
 
 export async function migrateDbIfNeeded(db: SQLite.SQLiteDatabase): Promise<void> {
@@ -261,6 +271,7 @@ export async function migrateDbIfNeeded(db: SQLite.SQLiteDatabase): Promise<void
   await ensureColumn(db, 'finishes', 'device_id', "TEXT NOT NULL DEFAULT 'unknown'");
   await ensureColumn(db, 'finishes', 'duplicate_of', 'TEXT REFERENCES finishes(id)');
   await ensureColumn(db, 'finishes', 'voided', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn(db, 'finishes', 'source', "TEXT NOT NULL DEFAULT 'funnel'");
 }
 
 async function ensureColumn(
@@ -501,6 +512,40 @@ export async function upsertParticipant(
   return { id, ...data, synced: 0 };
 }
 
+// Edits an existing entrant in place (e.g. a runner passing their place to
+// someone who isn't on the imported list). The bib number is deliberately not
+// editable: participants sync on (race_id, bib_number), so changing it would
+// leave the old bib behind remotely as a ghost entry. Same bib, new person.
+export async function updateParticipantDetails(
+  db: SQLite.SQLiteDatabase,
+  id: string,
+  data: Pick<
+    Participant,
+    'first_name' | 'last_name' | 'gender' | 'dob' | 'club' | 'category' | 'team_name' | 'sub_category'
+  >,
+): Promise<void> {
+  if (!hasParticipantIdentity(data)) {
+    throw new Error('Needs a first or last name, or a team name.');
+  }
+  await db.runAsync(
+    `UPDATE participants
+     SET first_name = ?, last_name = ?, gender = ?, dob = ?, club = ?, category = ?, team_name = ?,
+         sub_category = ?, synced = 0
+     WHERE id = ?`,
+    [
+      data.first_name ?? null,
+      data.last_name ?? null,
+      data.gender ?? null,
+      data.dob ?? null,
+      data.club ?? null,
+      data.category ?? null,
+      data.team_name ?? null,
+      data.sub_category ?? null,
+      id,
+    ],
+  );
+}
+
 // Bulk import from CSV — wrapped in a transaction so a few hundred rows
 // commit as one write instead of one fsync per row.
 export async function bulkUpsertParticipants(
@@ -603,7 +648,7 @@ export async function assignBibToTimestamp(
     'INSERT INTO finishes (id, race_id, bib_number, timestamp_id, gun_time, device_id) VALUES (?, ?, ?, ?, ?, ?)',
     [id, raceId, bibNumber, timestampId, gunTime, deviceId],
   );
-  return { id, race_id: raceId, bib_number: bibNumber, timestamp_id: timestampId, gun_time: gunTime, chip_time: null, device_id: deviceId, flagged: 0, duplicate_of: null, voided: 0, synced: 0 };
+  return { id, race_id: raceId, bib_number: bibNumber, timestamp_id: timestampId, gun_time: gunTime, chip_time: null, device_id: deviceId, flagged: 0, duplicate_of: null, voided: 0, source: 'funnel', synced: 0 };
 }
 
 export async function recordDirectFinish(
@@ -612,13 +657,14 @@ export async function recordDirectFinish(
   bibNumber: string,
   gunTime: number,
   deviceId: string,
+  source: Finish['source'] = 'funnel',
 ): Promise<Finish> {
   const id = uuid();
   await db.runAsync(
-    'INSERT INTO finishes (id, race_id, bib_number, timestamp_id, gun_time, device_id) VALUES (?, ?, ?, NULL, ?, ?)',
-    [id, raceId, bibNumber, gunTime, deviceId],
+    'INSERT INTO finishes (id, race_id, bib_number, timestamp_id, gun_time, device_id, source) VALUES (?, ?, ?, NULL, ?, ?, ?)',
+    [id, raceId, bibNumber, gunTime, deviceId, source],
   );
-  return { id, race_id: raceId, bib_number: bibNumber, timestamp_id: null, gun_time: gunTime, chip_time: null, device_id: deviceId, flagged: 0, duplicate_of: null, voided: 0, synced: 0 };
+  return { id, race_id: raceId, bib_number: bibNumber, timestamp_id: null, gun_time: gunTime, chip_time: null, device_id: deviceId, flagged: 0, duplicate_of: null, voided: 0, source, synced: 0 };
 }
 
 // ── Results editing ──────────────────────────────────────────────────────────
@@ -695,7 +741,9 @@ export async function linkFinishToTimestamp(
   flagged: boolean,
 ): Promise<void> {
   await db.runAsync(
-    'UPDATE finishes SET timestamp_id = ?, gun_time = ?, flagged = ?, synced = 0 WHERE id = ?',
+    // Linking a finish-line entry to a tap accepts it as a result, so it also
+    // becomes a 'funnel' (published) row.
+    "UPDATE finishes SET timestamp_id = ?, gun_time = ?, flagged = ?, source = 'funnel', synced = 0 WHERE id = ?",
     [timestampId, gunTime, flagged ? 1 : 0, finishId],
   );
 }

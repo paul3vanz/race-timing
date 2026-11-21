@@ -2,6 +2,7 @@ import { Stack, useLocalSearchParams } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Platform, ScrollView, Share, StyleSheet, Switch, Text, Pressable, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { useRaceSync } from '@/hooks/use-race-sync';
 import {
@@ -42,6 +43,7 @@ function PlaceRow({ place, runner }: { place: number; runner: RankedFinisher }) 
 export default function ReportScreen() {
   const { raceId } = useLocalSearchParams<{ raceId: string }>();
   const db = useSQLiteContext();
+  const insets = useSafeAreaInsets();
 
   const [race, setRace] = useState<Race | null>(null);
   const [event, setEvent] = useState<Event | null>(null);
@@ -97,7 +99,7 @@ export default function ReportScreen() {
           ),
         }}
       />
-      <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
+      <ScrollView style={styles.screen} contentContainerStyle={[styles.content, { paddingBottom: 48 + insets.bottom }]}>
         <Text style={styles.race}>{raceName}</Text>
         <Text style={styles.sub}>
           {report.totalFinishers} {report.totalFinishers === 1 ? 'finisher' : 'finishers'}

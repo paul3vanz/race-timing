@@ -28,9 +28,19 @@ import { startRaceRemote } from './sync';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+// How this device's Bib screen records entries:
+//  - 'funnel': the complete list typed at the end of the funnel, matched to the
+//    Timers' taps in order (or, with no taps to hand, recorded as typed and
+//    matched up later on Results).
+//  - 'line': a backup recorder at the finish line typing the bibs it can catch.
+//    Entries are timed as typed and never consume the tap queue; they are used
+//    to cross-check the Timers and fill gaps, not published as results.
+export type BibMode = 'funnel' | 'line';
+
 interface RaceStore {
   // Persisted across launches
   deviceId: string | null;
+  bibMode: BibMode;
 
   // Active race context — set when a race screen is opened
   activeRace: Race | null;
@@ -55,6 +65,8 @@ interface RaceStore {
 
   // Call once at app startup before rendering race screens
   initDeviceId: () => Promise<void>;
+
+  setBibMode: (mode: BibMode) => Promise<void>;
 
   // Load (or reload) all race data into the store
   loadRace: (db: SQLiteDatabase, raceId: string) => Promise<void>;
@@ -115,10 +127,32 @@ async function resolveDeviceId(): Promise<string> {
   return id;
 }
 
+const BIB_MODE_KEY = 'race_timing_bib_mode';
+
+async function readBibMode(): Promise<BibMode> {
+  try {
+    const raw =
+      Platform.OS === 'web' ? localStorage.getItem(BIB_MODE_KEY) : await SecureStore.getItemAsync(BIB_MODE_KEY);
+    return raw === 'line' ? 'line' : 'funnel';
+  } catch {
+    return 'funnel';
+  }
+}
+
+async function writeBibMode(mode: BibMode): Promise<void> {
+  try {
+    if (Platform.OS === 'web') localStorage.setItem(BIB_MODE_KEY, mode);
+    else await SecureStore.setItemAsync(BIB_MODE_KEY, mode);
+  } catch {
+    // Not persisting just means the device reverts to funnel on restart.
+  }
+}
+
 // ── Store ─────────────────────────────────────────────────────────────────────
 
 export const useRaceStore = create<RaceStore>((set, get) => ({
   deviceId: null,
+  bibMode: 'funnel',
   activeRace: null,
   event: null,
   timestamps: [],
@@ -128,8 +162,13 @@ export const useRaceStore = create<RaceStore>((set, get) => ({
   entryStack: [],
 
   initDeviceId: async () => {
-    const deviceId = await resolveDeviceId();
-    set({ deviceId });
+    const [deviceId, bibMode] = await Promise.all([resolveDeviceId(), readBibMode()]);
+    set({ deviceId, bibMode });
+  },
+
+  setBibMode: async (mode) => {
+    set({ bibMode: mode });
+    await writeBibMode(mode);
   },
 
   loadRace: async (db, raceId) => {
@@ -227,13 +266,21 @@ export const useRaceStore = create<RaceStore>((set, get) => ({
 
   assignBib: async (db, bibNumber) => {
     const capturedAt = Date.now();
-    const { activeRace, unassigned, deviceId, event } = get();
+    const { activeRace, unassigned, deviceId, event, bibMode } = get();
     if (!activeRace?.start_time || !deviceId || event?.status === 'finished') return null;
 
-    const head = unassigned[0];
+    // Finish-line entries are timed as typed and leave the tap queue alone.
+    const head = bibMode === 'funnel' ? unassigned[0] : undefined;
     const finish = head
       ? await assignBibToTimestamp(db, activeRace.id, bibNumber, head.id, head.time - activeRace.start_time, deviceId)
-      : await recordDirectFinish(db, activeRace.id, bibNumber, capturedAt - activeRace.start_time, deviceId);
+      : await recordDirectFinish(
+          db,
+          activeRace.id,
+          bibNumber,
+          capturedAt - activeRace.start_time,
+          deviceId,
+          bibMode === 'line' ? 'line' : 'funnel',
+        );
 
     set((state) => {
       const finishes = [...state.finishes, finish].sort((a, b) => (a.gun_time ?? 0) - (b.gun_time ?? 0));

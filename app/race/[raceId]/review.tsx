@@ -5,6 +5,7 @@ import { useSQLiteContext } from 'expo-sqlite';
 import Papa from 'papaparse';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Alert, FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { BibEditSheet, type SheetAction } from '@/components/bib-edit-sheet';
 import { DeviceActivityStrip, ResultRowView, type EditTarget } from '@/components/reconcile-row';
@@ -84,6 +85,7 @@ export default function ReviewScreen() {
   const { raceId } = useLocalSearchParams<{ raceId: string }>();
   const db = useSQLiteContext();
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const deviceId = useRaceStore((s) => s.deviceId);
 
   const [race, setRace] = useState<Race | null>(null);
@@ -372,6 +374,8 @@ export default function ReviewScreen() {
 
       <FlatList
         style={styles.list}
+        // Keep the last rows clear of the Android navigation bar.
+        contentContainerStyle={{ paddingBottom: insets.bottom + 24 }}
         data={view.rows}
         keyExtractor={(item) => item.key}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#fff" />}

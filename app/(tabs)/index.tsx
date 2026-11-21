@@ -1,6 +1,6 @@
-import { useRouter } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import {
   Alert,
   FlatList,
@@ -79,7 +79,14 @@ export default function HomeScreen() {
     setRows(all);
   };
 
-  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // Reload every time the Races tab comes back into view. The tab stays mounted
+  // underneath the Timer/Bib/Results screens, so loading only on mount left a
+  // race that had just been started showing "Not started" until the app restarted.
+  useFocusEffect(
+    useCallback(() => {
+      load();
+    }, []), // eslint-disable-line react-hooks/exhaustive-deps
+  );
 
   // The create/join forms live at the TOP of the list, not in a footer: on
   // Android the on-screen keyboard covers anything pinned to the bottom of the

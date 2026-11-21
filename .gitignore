@@ -42,3 +42,6 @@ app-example
 # generated native folders
 /ios
 /android
+
+# Native build output from the local volume-keys module
+modules/*/android/build/

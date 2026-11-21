@@ -63,7 +63,10 @@ export function clusterActiveTaps(taps: Timestamp[], windowMs?: number): TapClus
 export interface MergeModel {
   clusters: TapCluster[]; // time-ordered
   linked: Map<string, Finish[]>; // cluster.id -> finishes pointing at it
-  orphanFinishes: Finish[]; // active finishes with no live tap behind them
+  orphanFinishes: Finish[]; // active funnel finishes with no live tap behind them
+  // A backup recorder's finish-line entries (finishes.source = 'line'): evidence
+  // used to cross-check the Timers and fill gaps, never results in their own right.
+  lineEntries: Finish[];
   unlinkedClusters: TapCluster[];
 }
 
@@ -82,7 +85,14 @@ export function buildModel(taps: Timestamp[], finishes: Finish[]): MergeModel {
 
   const linked = new Map<string, Finish[]>();
   const orphanFinishes: Finish[] = [];
+  const lineEntries: Finish[] = [];
   for (const f of finishes.filter(isActiveFinish)) {
+    if (f.source === 'line') {
+      // Linking a line entry to a tap promotes it to 'funnel', so a 'line' row
+      // is by definition still unlinked evidence.
+      lineEntries.push(f);
+      continue;
+    }
     const cluster = f.timestamp_id ? clusterByTapId.get(f.timestamp_id) : undefined;
     if (cluster) {
       const list = linked.get(cluster.id) ?? [];
@@ -96,11 +106,13 @@ export function buildModel(taps: Timestamp[], finishes: Finish[]): MergeModel {
     list.sort((a, b) => (a.gun_time ?? 0) - (b.gun_time ?? 0) || a.id.localeCompare(b.id));
   }
   orphanFinishes.sort((a, b) => (a.gun_time ?? 0) - (b.gun_time ?? 0));
+  lineEntries.sort((a, b) => (a.gun_time ?? 0) - (b.gun_time ?? 0));
 
   return {
     clusters,
     linked,
     orphanFinishes,
+    lineEntries,
     unlinkedClusters: clusters.filter((c) => !linked.has(c.id)),
   };
 }
@@ -127,7 +139,7 @@ export function buildQueue(taps: Timestamp[], finishes: Finish[]): QueueItem[] {
 export interface DeviceLabel {
   short: string; // "T1", "B1", "M"
   long: string; // "Timer 1 (this device)"
-  role: 'timer' | 'bib' | 'manual';
+  role: 'timer' | 'bib' | 'line' | 'manual';
 }
 
 // Manual (operator-inserted) taps are recorded under a per-device id
@@ -159,17 +171,29 @@ export function labelDevices(
     );
 
   const firstBib = new Map<string, number>();
+  const hasFunnelEntry = new Set<string>();
   for (const f of finishes) {
     if (labels.has(f.device_id) || f.device_id === 'unknown') continue;
+    if (f.source !== 'line') hasFunnelEntry.add(f.device_id);
     const prev = firstBib.get(f.device_id);
     const at = f.gun_time ?? 0;
     if (prev === undefined || at < prev) firstBib.set(f.device_id, at);
   }
+  // A device whose entries are all finish-line entries is a backup recorder
+  // ("Finish line 1"); anything that typed funnel entries is a Bib device.
+  let bibN = 0;
+  let lineN = 0;
   [...firstBib.entries()]
     .sort((a, b) => a[1] - b[1])
-    .forEach(([id], i) =>
-      labels.set(id, { short: `B${i + 1}`, long: `Bib ${i + 1}${suffix(id)}`, role: 'bib' }),
-    );
+    .forEach(([id]) => {
+      if (hasFunnelEntry.has(id)) {
+        bibN += 1;
+        labels.set(id, { short: `B${bibN}`, long: `Bib ${bibN}${suffix(id)}`, role: 'bib' });
+      } else {
+        lineN += 1;
+        labels.set(id, { short: `L${lineN}`, long: `Finish line ${lineN}${suffix(id)}`, role: 'line' });
+      }
+    });
 
   for (const t of taps) {
     if (isManualDevice(t.device_id) && !labels.has(t.device_id)) {
@@ -236,7 +260,9 @@ export function computeFinishers(model: MergeModel, startTime: number): Finisher
       out.push({ finish, bib: finish.bib_number, time: cluster.time - startTime, cluster });
     }
   }
-  for (const finish of model.orphanFinishes) {
+  // With no Timer taps at all, finish-line entries are all there is.
+  const orphans = model.clusters.length === 0 ? [...model.orphanFinishes, ...model.lineEntries] : model.orphanFinishes;
+  for (const finish of orphans) {
     out.push({ finish, bib: finish.bib_number, time: finish.gun_time ?? 0, cluster: null });
   }
   return out.sort((a, b) => a.time - b.time);
@@ -249,21 +275,20 @@ export interface Proposal {
   unmatchedTaps: CanonicalTap[];
   unmatchedBibs: CanonicalBibEntry[]; // no disagreement — genuinely just missing a tap
   disagreements: CanonicalBibEntry[]; // devices reported different bib numbers
+  lineBibIds: Set<string>; // finish ids of proposed entries that came from a finish-line recorder
 }
 
-export const EMPTY_PROPOSAL: Proposal = { pairs: [], unmatchedTaps: [], unmatchedBibs: [], disagreements: [] };
+export const EMPTY_PROPOSAL: Proposal = {
+  pairs: [],
+  unmatchedTaps: [],
+  unmatchedBibs: [],
+  disagreements: [],
+  lineBibIds: new Set(),
+};
 
-// Proposes pairings between still-unlinked tap clusters and orphan bibs, by
-// time alignment. Only used for the "Bib device was offline / typed live"
-// case — a Bib device that had the tap queue links entries at entry time.
-export function buildProposal(model: MergeModel, startTime: number): Proposal {
-  const taps: CanonicalTap[] = model.unlinkedClusters.map((c) => ({
-    time: c.time,
-    sourceIds: c.tapIds,
-    corroboration: c.deviceIds.length,
-  }));
-  const canonicalBibs = clusterBibEntries(
-    model.orphanFinishes.map((f) => ({
+const toBibEntries = (finishes: Finish[], startTime: number) =>
+  clusterBibEntries(
+    finishes.map((f) => ({
       id: f.id,
       deviceId: f.device_id,
       bibNumber: f.bib_number,
@@ -272,13 +297,110 @@ export function buildProposal(model: MergeModel, startTime: number): Proposal {
       time: startTime + (f.gun_time ?? 0),
     })),
   );
-  const { pairs, unmatchedTaps, unmatchedBibs } = alignFinishers(taps, canonicalBibs);
+
+// Proposes pairings between still-unlinked tap clusters and bibs that have no
+// tap behind them, by time alignment, in two passes:
+//  1. funnel entries typed with no tap queue to hand (a Bib device that was
+//     offline). These are the complete list, typed some seconds after the
+//     crossing, so they get first claim on the taps.
+//  2. finish-line entries whose bib is not in the funnel list at all: a runner
+//     the funnel recorder missed. The taps left over from pass 1 are the only
+//     candidates, so a missed bib can be recovered even though the line
+//     recorder's list is partial.
+// A finish-line entry for a bib the funnel list already has is never proposed
+// again; it is used as a cross-check on that runner's time instead.
+export function buildProposal(model: MergeModel, startTime: number): Proposal {
+  const taps: CanonicalTap[] = model.unlinkedClusters.map((c) => ({
+    time: c.time,
+    sourceIds: c.tapIds,
+    corroboration: c.deviceIds.length,
+  }));
+
+  const funnelBibs = toBibEntries(model.orphanFinishes, startTime);
+  const pass1 = alignFinishers(taps, funnelBibs);
+
+  const mainBibs = new Set<string>();
+  for (const list of model.linked.values()) for (const f of list) mainBibs.add(f.bib_number);
+  for (const f of model.orphanFinishes) mainBibs.add(f.bib_number);
+  const lineCandidates = model.lineEntries.filter((f) => !mainBibs.has(f.bib_number));
+  const lineBibs = toBibEntries(lineCandidates, startTime);
+  const pass2 = alignFinishers(pass1.unmatchedTaps, lineBibs);
+
+  const lineBibIds = new Set(lineBibs.flatMap((b) => b.sourceIds));
   return {
-    pairs,
-    unmatchedTaps,
-    unmatchedBibs: unmatchedBibs.filter((b) => b.disagreement === null),
-    disagreements: canonicalBibs.filter((b) => b.disagreement !== null),
+    pairs: [...pass1.pairs, ...pass2.pairs],
+    unmatchedTaps: pass2.unmatchedTaps,
+    unmatchedBibs: [...pass1.unmatchedBibs, ...pass2.unmatchedBibs].filter((b) => b.disagreement === null),
+    disagreements: [...funnelBibs, ...lineBibs].filter((b) => b.disagreement !== null),
+    lineBibIds,
   };
+}
+
+// ── Finish-line cross-check ──────────────────────────────────────────────────
+
+// A finish-line recorder types a bib a moment after the runner crosses. If the
+// time they recorded for a bib points at a different tap than the one that bib
+// is linked to, the bib was probably matched to the wrong tap (a stray tap or a
+// missed one upstream shifted the order). Judged against the neighbouring taps
+// rather than a fixed number of seconds, because finishers can be a couple of
+// seconds apart in a bunch and ten seconds apart on a quiet stretch.
+export const LINE_AGREE_MS = 15_000; // beyond this it's wrong whatever the neighbours look like
+const LINE_DEFAULT_DELAY_MS = 2_000; // typical lag between crossing and the bib being typed
+const LINE_MIN_DISAGREE_MS = 4_000; // typing jitter below this is never worth flagging
+
+export interface LineCheck {
+  status: 'agrees' | 'disagrees';
+  deltaMs: number; // finish-line time minus timer time; positive = line recorded it later
+}
+
+function medianOf(nums: number[]): number {
+  const sorted = [...nums].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+function lineDeltaFor(bib: string, clusterTime: number, lineEntries: Finish[], startTime: number): number | null {
+  let best: number | null = null;
+  for (const f of lineEntries) {
+    if (f.bib_number !== bib) continue;
+    const delta = startTime + (f.gun_time ?? 0) - clusterTime;
+    if (best === null || Math.abs(delta) < Math.abs(best)) best = delta;
+  }
+  return best;
+}
+
+// How late, typically, this race's finish-line recorder types a bib, measured
+// from the bibs both lists agree on. Falls back to a default until there are
+// enough to measure.
+export function estimateLineDelay(model: MergeModel, startTime: number): number {
+  const deltas: number[] = [];
+  for (const cluster of model.clusters) {
+    for (const f of model.linked.get(cluster.id) ?? []) {
+      const d = lineDeltaFor(f.bib_number, cluster.time, model.lineEntries, startTime);
+      if (d !== null && Math.abs(d) <= LINE_AGREE_MS) deltas.push(d);
+    }
+  }
+  return deltas.length >= 3 ? medianOf(deltas) : LINE_DEFAULT_DELAY_MS;
+}
+
+export function checkAgainstLine(
+  bib: string,
+  cluster: TapCluster,
+  model: MergeModel,
+  startTime: number,
+  lineDelayMs: number,
+): LineCheck | null {
+  const delta = lineDeltaFor(bib, cluster.time, model.lineEntries, startTime);
+  if (delta === null) return null;
+
+  const off = Math.abs(delta - lineDelayMs);
+  const crossedAt = cluster.time + delta - lineDelayMs; // when the line recorder says the runner crossed
+  let closest = cluster;
+  for (const c of model.clusters) {
+    if (Math.abs(c.time - crossedAt) < Math.abs(closest.time - crossedAt)) closest = c;
+  }
+  const disagrees = off > LINE_AGREE_MS || (closest.id !== cluster.id && off > LINE_MIN_DISAGREE_MS);
+  return { status: disagrees ? 'disagrees' : 'agrees', deltaMs: delta };
 }
 
 // ── Results rows ─────────────────────────────────────────────────────────────
@@ -305,6 +427,7 @@ export type ResultRow =
       extraEntries: number; // further bib entries pointing at the same tap
       name: string | null;
       deviceLabels: string[]; // short labels of the Timers that captured it
+      line: LineCheck | null; // what a finish-line recorder saw for this bib, if anything
       flags: RowFlags;
     }
   | {
@@ -316,6 +439,7 @@ export type ResultRow =
       bibTime: number;
       pair: ReconciledPair;
       name: string | null;
+      fromLine: boolean; // the bib came from a finish-line recorder rather than the funnel list
       flags: RowFlags;
     }
   | {
@@ -328,7 +452,15 @@ export type ResultRow =
       pair: ReconciledPair | null;
     }
   | { kind: 'gap-tap'; key: string; position: null; time: number; tap: CanonicalTap; missingTimers: string[] }
-  | { kind: 'gap-bib'; key: string; position: number; time: number; bibTime: number; bib: CanonicalBibEntry };
+  | {
+      kind: 'gap-bib';
+      key: string;
+      position: number;
+      time: number;
+      bibTime: number;
+      bib: CanonicalBibEntry;
+      fromLine: boolean;
+    };
 
 export interface DeviceSummary {
   deviceId: string;
@@ -375,7 +507,11 @@ export function buildResultsView(input: {
   // With no Timer taps at all this is a bib-only race (bibs typed live as
   // runners finish): its entries are the results, not unmatched leftovers.
   const bibOnly = model.clusters.length === 0;
+  const bibOnlyEntries = bibOnly
+    ? [...model.orphanFinishes, ...model.lineEntries].sort((a, b) => (a.gun_time ?? 0) - (b.gun_time ?? 0))
+    : [];
   const proposal = bibOnly ? EMPTY_PROPOSAL : buildProposal(model, startTime);
+  const lineDelay = estimateLineDelay(model, startTime);
   const disagreementKeys = new Set(proposal.disagreements.map((d) => d.sourceIds[0]));
 
   interface Draft {
@@ -414,13 +550,14 @@ export function buildResultsView(input: {
         extraEntries: extra.length,
         name: nameOf(participantByBib.get(finish.bib_number)),
         deviceLabels: cluster.deviceIds.map(shortOf),
+        line: checkAgainstLine(finish.bib_number, cluster, model, startTime, lineDelay),
         flags: flagsFor(finish.bib_number, dupBibs, missing, finish.flagged === 1),
       }),
     });
   }
 
   if (bibOnly) {
-    for (const finish of model.orphanFinishes) {
+    for (const finish of bibOnlyEntries) {
       drafts.push({
         key: `finish-${finish.id}`,
         time: finish.gun_time ?? 0,
@@ -436,6 +573,7 @@ export function buildResultsView(input: {
           extraEntries: 0,
           name: nameOf(participantByBib.get(finish.bib_number)),
           deviceLabels: [],
+          line: null,
           flags: flagsFor(finish.bib_number, dupBibs, [], false),
         }),
       });
@@ -459,6 +597,7 @@ export function buildResultsView(input: {
           bibTime,
           pair,
           name: nameOf(participantByBib.get(pair.bib.bibNumber)),
+          fromLine: proposal.lineBibIds.has(pair.bib.sourceIds[0]),
           flags: flagsFor(pair.bib.bibNumber, dupBibs, [], pair.flagged),
         }),
       });
@@ -518,6 +657,7 @@ export function buildResultsView(input: {
           time: bibTime,
           bibTime,
           bib,
+          fromLine: proposal.lineBibIds.has(bib.sourceIds[0]),
         }),
       });
     }
@@ -544,7 +684,8 @@ export function buildResultsView(input: {
       r.flags.dupBib ||
       r.flags.unknownBib ||
       r.flags.lowConfidence ||
-      r.flags.missingTimers.length > 0
+      r.flags.missingTimers.length > 0 ||
+      r.line?.status === 'disagrees'
     );
   }).length;
 
@@ -561,7 +702,7 @@ export function buildResultsView(input: {
     const deviceFinishes = finishes.filter((f) => f.device_id === deviceId);
     const tapsActive = deviceTaps.filter(isActiveTap).length;
     const finishesActive = deviceFinishes.filter(isActiveFinish).length;
-    const isTimer = label.role !== 'bib';
+    const isTimer = label.role === 'timer' || label.role === 'manual';
     devices.push({
       deviceId,
       label,

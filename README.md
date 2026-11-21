@@ -35,19 +35,46 @@ the Settings tab.
 
 ## Race day: several devices
 
-Typical set-up is two phones on **Timer**, one on **Bib**, and optionally a
-third watching **Results**. Join the other phones with the race's 6-character
-code (Races tab, Join Race). Every device writes to its own local SQLite and
-syncs through Supabase; the Bib queue and the Results screen both merge the
-taps from every Timer, so taps within about 1.5s on different Timers count as
-one finisher. Results can be corrected from any device (tap a row to fix a
-bib, discard a stray tap, or remove an entry) and the change syncs to the rest.
-Use **Stop** on the Races list to close a race, and **Prizes** on the Results
-screen for the prize-giving report.
+Every device writes to its own local SQLite, so nothing needs a connection
+during the race. Phones join the same race with its 6-character code (Races
+tab, Join Race) and sync through Supabase whenever they have signal. Results
+merges the raw rows from every device, so any phone or the web build can be
+used to watch and correct the results.
 
-Apply `supabase/migrations/20261112100000_duplicate_bibs_and_voided_finishes.sql`
-(`supabase db push`) before installing this version on the phones, otherwise
-finish rows are rejected by the remote until it has the new column.
+A typical set-up:
+
+| Who | Where | Screen | What it records |
+| --- | --- | --- | --- |
+| Two timers | Finish line | **Timer** | A tap per finisher, no bibs. Taps within about 1.5s on different timers count as one finisher, so one missing a click or tapping twice is caught by the other. |
+| Backup bib recorder | Finish line | **Bib**, mode **finish line** | The bibs they can catch, timed as typed. A partial list, used to cross-check the timers and to recover a runner the funnel missed. Not published as results. |
+| Funnel bib recorder | End of the funnel | **Bib**, mode **funnel** (default) | The complete list. With the timers' taps on the phone (it has signal) each bib is matched to the next tap in order; offline, bibs are timed as typed and matched to taps afterwards on Results. A few seconds' lag is expected and handled. |
+| Anyone | Anywhere | **Results** | Fix a mistyped bib, discard a stray tap, add a missed one, or re-match bibs to taps in order. Edits sync to every device. |
+
+Switch a Bib phone between **funnel** and **finish line** with the mode button
+at the top of its screen. After the race, sync the phones, open Results and tap
+**Confirm all confident matches** so the corrected times are what gets
+published. Use **Stop** on the Races list to close a race and **Prizes** on the
+Results screen for the prize-giving report.
+
+### What the live results page sees
+
+The public (`anon`) role can only read published results from `finishes`: not
+removed entries, not folded-in duplicates, and not finish-line entries (see
+`supabase/migrations/20261121100000_finish_source_and_published_results.sql`).
+The website needs no change for this to apply. The app itself reads as a signed-in
+anonymous session so it still sees every raw row.
+
+### Applying migrations
+
+The `supabase` CLI now defaults to a local Docker database; target the hosted
+project explicitly:
+
+```bash
+npx supabase db push --remote
+```
+
+Apply new migrations before installing a build that needs them, otherwise the
+remote rejects the new columns until it has them.
 
 ### Volume buttons as the Timer tap
 
