@@ -20,7 +20,8 @@
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
-      "package": "uk.org.bpj.timing.app"
+      "package": "uk.org.bpj.timing.app",
+      "versionCode": 2
     },
     "web": {
       "output": "static",
