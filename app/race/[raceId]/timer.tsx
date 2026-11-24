@@ -8,6 +8,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { useRaceStartPoll } from '@/hooks/use-race-start-poll';
 import { useVolumeKeyTap } from '@/hooks/use-volume-key-tap';
+import { exportRawData } from '@/lib/export-file';
 import { isActiveTap } from '@/lib/merge';
 import { useRaceStore } from '@/lib/store';
 import { pullRaceData } from '@/lib/sync';
@@ -177,6 +178,10 @@ export default function TimerScreen() {
               <Text style={styles.stoppedNote}>
                 {count} {count === 1 ? 'tap' : 'taps'} recorded on this device.
               </Text>
+              {/* Raw taps with finish times, no bibs needed and no signal needed */}
+              <Pressable style={styles.exportBtn} onPress={() => exportRawData(db, activeRace.id)}>
+                <Text style={styles.exportBtnText}>Export taps (CSV)</Text>
+              </Pressable>
               <Pressable style={styles.reopenBtn} onPress={() => setRaceStopped(db, false)}>
                 <Text style={styles.reopenBtnText}>Reopen race</Text>
               </Pressable>
@@ -303,6 +308,17 @@ const styles = StyleSheet.create({
     color: '#555',
     fontSize: 15,
     textAlign: 'center',
+  },
+  exportBtn: {
+    backgroundColor: '#1b5e20',
+    paddingVertical: 16,
+    paddingHorizontal: 40,
+    borderRadius: 14,
+  },
+  exportBtnText: {
+    color: '#fff',
+    fontSize: 17,
+    fontWeight: '600',
   },
   reopenBtn: {
     backgroundColor: '#1e1e1e',

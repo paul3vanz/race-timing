@@ -20,8 +20,18 @@ export interface Race {
   start_time: number | null; // Unix ms
   wave: number;
   max_bib: number; // highest expected bib number — drives auto-submit digit count
+  // 'single': each runner crosses once, so a repeated bib is a problem (usually
+  // a mistyped number) and is shown in both places for correction.
+  // 'laps': a repeated bib is the runner starting another lap.
+  format: RaceFormat;
   synced: 0 | 1;
 }
+
+export type RaceFormat = 'single' | 'laps';
+
+// Entrant status set on the day: 'dns' did not start (e.g. never collected a
+// bib), 'dnf' started but dropped out. Neither is expected in the results.
+export type ParticipantStatus = 'dns' | 'dnf';
 
 export interface Participant {
   id: string;
@@ -35,6 +45,7 @@ export interface Participant {
   category: string | null;
   team_name: string | null; // set for team entries — one row per team, sharing a bib
   sub_category: string | null; // e.g. solo/pair/team — bibs are allocated and results grouped per value
+  status: ParticipantStatus | null; // null = expected to start and finish
   synced: 0 | 1;
 }
 
@@ -54,6 +65,7 @@ export interface Timestamp {
   voided: 0 | 1; // operator discarded this as a mistake (e.g. a double-click) — never deleted
   is_manual: 0 | 1; // operator-inserted, backfilling a tap a Timer device missed
   duplicate_of: string | null; // set when a backup device's tap is a corroborating capture of another timestamp's row, not a separate finisher
+  operator_name: string | null; // who was using the device, so each row can be traced to a person
   synced: 0 | 1;
 }
 
@@ -72,6 +84,8 @@ export interface Finish {
   // 'line' entries are a backup recorder's partial list typed at the finish line: kept as evidence
   // to cross-check the timers and fill gaps, never published as results on their own.
   source: 'funnel' | 'line';
+  entered_at: number | null; // Unix ms the bib was typed (null on rows from older builds)
+  operator_name: string | null;
   synced: 0 | 1;
 }
 
@@ -239,6 +253,21 @@ const MIGRATIONS: string[] = [
   // partial cross-check of the Timer taps, not a second set of results, so they
   // need to be told apart from the funnel recorder's complete list.
   `ALTER TABLE finishes ADD COLUMN source TEXT NOT NULL DEFAULT 'funnel';`,
+
+  // v11 — feedback from the first single-lap event:
+  //  - operator_name on timestamps/finishes, so every row can be traced to the
+  //    person using the device.
+  //  - finishes.entered_at, when the bib was actually typed (gun_time is the
+  //    matched tap's time), so the raw export can list entries in typed order.
+  //  - participants.status for DNS/DNF, so missing runners aren't chased.
+  //  - races.format, single lap (a repeated bib is a mistake) or laps.
+  `
+  ALTER TABLE timestamps ADD COLUMN operator_name TEXT;
+  ALTER TABLE finishes ADD COLUMN operator_name TEXT;
+  ALTER TABLE finishes ADD COLUMN entered_at INTEGER;
+  ALTER TABLE participants ADD COLUMN status TEXT;
+  ALTER TABLE races ADD COLUMN format TEXT NOT NULL DEFAULT 'single';
+  `,
 ];
 
 export async function migrateDbIfNeeded(db: SQLite.SQLiteDatabase): Promise<void> {
@@ -272,6 +301,11 @@ export async function migrateDbIfNeeded(db: SQLite.SQLiteDatabase): Promise<void
   await ensureColumn(db, 'finishes', 'duplicate_of', 'TEXT REFERENCES finishes(id)');
   await ensureColumn(db, 'finishes', 'voided', 'INTEGER NOT NULL DEFAULT 0');
   await ensureColumn(db, 'finishes', 'source', "TEXT NOT NULL DEFAULT 'funnel'");
+  await ensureColumn(db, 'timestamps', 'operator_name', 'TEXT');
+  await ensureColumn(db, 'finishes', 'operator_name', 'TEXT');
+  await ensureColumn(db, 'finishes', 'entered_at', 'INTEGER');
+  await ensureColumn(db, 'participants', 'status', 'TEXT');
+  await ensureColumn(db, 'races', 'format', "TEXT NOT NULL DEFAULT 'single'");
 }
 
 async function ensureColumn(
@@ -386,10 +420,18 @@ export async function createRace(
 ): Promise<Race> {
   const id = uuid();
   await db.runAsync(
-    'INSERT INTO races (id, event_id, name, start_time, wave, max_bib) VALUES (?, ?, ?, ?, ?, ?)',
-    [id, data.event_id, data.name, data.start_time ?? null, data.wave, data.max_bib],
+    'INSERT INTO races (id, event_id, name, start_time, wave, max_bib, format) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [id, data.event_id, data.name, data.start_time ?? null, data.wave, data.max_bib, data.format],
   );
   return { id, ...data, synced: 0 };
+}
+
+export async function setRaceFormat(
+  db: SQLite.SQLiteDatabase,
+  raceId: string,
+  format: RaceFormat,
+): Promise<void> {
+  await db.runAsync('UPDATE races SET format = ?, synced = 0 WHERE id = ?', [format, raceId]);
 }
 
 export async function setRaceStartTime(
@@ -458,9 +500,11 @@ function hasParticipantIdentity(
   return Boolean(data.first_name || data.last_name || data.team_name);
 }
 
+// DNS/DNF status is deliberately left alone here: a CSV re-import or a pull of
+// the start list must not undo who has been marked as not starting.
 export async function upsertParticipant(
   db: SQLite.SQLiteDatabase,
-  data: Omit<Participant, 'id' | 'synced'>,
+  data: Omit<Participant, 'id' | 'synced' | 'status'>,
 ): Promise<Participant> {
   if (!hasParticipantIdentity(data)) {
     throw new Error(`Bib ${data.bib_number} needs a first/last name or a team name.`);
@@ -488,7 +532,7 @@ export async function upsertParticipant(
         existing.id,
       ],
     );
-    return { ...existing, ...data, synced: 0 };
+    return { ...existing, ...data, status: existing.status ?? null, synced: 0 };
   }
   const id = uuid();
   await db.runAsync(
@@ -509,7 +553,15 @@ export async function upsertParticipant(
       data.sub_category ?? null,
     ],
   );
-  return { id, ...data, synced: 0 };
+  return { id, ...data, status: null, synced: 0 };
+}
+
+export async function setParticipantStatus(
+  db: SQLite.SQLiteDatabase,
+  id: string,
+  status: ParticipantStatus | null,
+): Promise<void> {
+  await db.runAsync('UPDATE participants SET status = ?, synced = 0 WHERE id = ?', [status, id]);
 }
 
 // Edits an existing entrant in place (e.g. a runner passing their place to
@@ -550,7 +602,7 @@ export async function updateParticipantDetails(
 // commit as one write instead of one fsync per row.
 export async function bulkUpsertParticipants(
   db: SQLite.SQLiteDatabase,
-  rows: Omit<Participant, 'id' | 'synced'>[],
+  rows: Omit<Participant, 'id' | 'synced' | 'status'>[],
 ): Promise<number> {
   let count = 0;
   await db.withTransactionAsync(async () => {
@@ -594,6 +646,7 @@ export async function recordTimestamp(
   raceId: string,
   deviceId: string,
   recordedAt: number,
+  operatorName: string | null = null,
 ): Promise<Timestamp> {
   const result = await db.getFirstAsync<{ max_seq: number | null }>(
     'SELECT MAX(sequence_num) AS max_seq FROM timestamps WHERE race_id = ? AND device_id = ?',
@@ -602,10 +655,10 @@ export async function recordTimestamp(
   const sequence_num = (result?.max_seq ?? 0) + 1;
   const id = uuid();
   await db.runAsync(
-    'INSERT INTO timestamps (id, race_id, recorded_at, device_id, sequence_num) VALUES (?, ?, ?, ?, ?)',
-    [id, raceId, recordedAt, deviceId, sequence_num],
+    'INSERT INTO timestamps (id, race_id, recorded_at, device_id, sequence_num, operator_name) VALUES (?, ?, ?, ?, ?, ?)',
+    [id, raceId, recordedAt, deviceId, sequence_num, operatorName],
   );
-  return { id, race_id: raceId, recorded_at: recordedAt, device_id: deviceId, sequence_num, voided: 0, is_manual: 0, duplicate_of: null, synced: 0 };
+  return { id, race_id: raceId, recorded_at: recordedAt, device_id: deviceId, sequence_num, voided: 0, is_manual: 0, duplicate_of: null, operator_name: operatorName, synced: 0 };
 }
 
 export async function getUnsyncedTimestamps(db: SQLite.SQLiteDatabase): Promise<Timestamp[]> {
@@ -642,13 +695,15 @@ export async function assignBibToTimestamp(
   timestampId: string,
   gunTime: number,
   deviceId: string,
+  operatorName: string | null = null,
+  enteredAt: number = Date.now(),
 ): Promise<Finish> {
   const id = uuid();
   await db.runAsync(
-    'INSERT INTO finishes (id, race_id, bib_number, timestamp_id, gun_time, device_id) VALUES (?, ?, ?, ?, ?, ?)',
-    [id, raceId, bibNumber, timestampId, gunTime, deviceId],
+    'INSERT INTO finishes (id, race_id, bib_number, timestamp_id, gun_time, device_id, entered_at, operator_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [id, raceId, bibNumber, timestampId, gunTime, deviceId, enteredAt, operatorName],
   );
-  return { id, race_id: raceId, bib_number: bibNumber, timestamp_id: timestampId, gun_time: gunTime, chip_time: null, device_id: deviceId, flagged: 0, duplicate_of: null, voided: 0, source: 'funnel', synced: 0 };
+  return { id, race_id: raceId, bib_number: bibNumber, timestamp_id: timestampId, gun_time: gunTime, chip_time: null, device_id: deviceId, flagged: 0, duplicate_of: null, voided: 0, source: 'funnel', entered_at: enteredAt, operator_name: operatorName, synced: 0 };
 }
 
 export async function recordDirectFinish(
@@ -658,13 +713,15 @@ export async function recordDirectFinish(
   gunTime: number,
   deviceId: string,
   source: Finish['source'] = 'funnel',
+  operatorName: string | null = null,
+  enteredAt: number = Date.now(),
 ): Promise<Finish> {
   const id = uuid();
   await db.runAsync(
-    'INSERT INTO finishes (id, race_id, bib_number, timestamp_id, gun_time, device_id, source) VALUES (?, ?, ?, NULL, ?, ?, ?)',
-    [id, raceId, bibNumber, gunTime, deviceId, source],
+    'INSERT INTO finishes (id, race_id, bib_number, timestamp_id, gun_time, device_id, source, entered_at, operator_name) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)',
+    [id, raceId, bibNumber, gunTime, deviceId, source, enteredAt, operatorName],
   );
-  return { id, race_id: raceId, bib_number: bibNumber, timestamp_id: null, gun_time: gunTime, chip_time: null, device_id: deviceId, flagged: 0, duplicate_of: null, voided: 0, source, synced: 0 };
+  return { id, race_id: raceId, bib_number: bibNumber, timestamp_id: null, gun_time: gunTime, chip_time: null, device_id: deviceId, flagged: 0, duplicate_of: null, voided: 0, source, entered_at: enteredAt, operator_name: operatorName, synced: 0 };
 }
 
 // ── Results editing ──────────────────────────────────────────────────────────
@@ -705,6 +762,7 @@ export async function insertManualTimestamp(
   raceId: string,
   recordedAt: number,
   insertingDeviceId: string,
+  operatorName: string | null = null,
 ): Promise<Timestamp> {
   const deviceId = `manual-${insertingDeviceId.slice(0, 8)}`;
   const result = await db.getFirstAsync<{ max_seq: number | null }>(
@@ -714,10 +772,10 @@ export async function insertManualTimestamp(
   const sequence_num = (result?.max_seq ?? 0) + 1;
   const id = uuid();
   await db.runAsync(
-    'INSERT INTO timestamps (id, race_id, recorded_at, device_id, sequence_num, is_manual) VALUES (?, ?, ?, ?, ?, 1)',
-    [id, raceId, recordedAt, deviceId, sequence_num],
+    'INSERT INTO timestamps (id, race_id, recorded_at, device_id, sequence_num, is_manual, operator_name) VALUES (?, ?, ?, ?, ?, 1, ?)',
+    [id, raceId, recordedAt, deviceId, sequence_num, operatorName],
   );
-  return { id, race_id: raceId, recorded_at: recordedAt, device_id: deviceId, sequence_num, voided: 0, is_manual: 1, duplicate_of: null, synced: 0 };
+  return { id, race_id: raceId, recorded_at: recordedAt, device_id: deviceId, sequence_num, voided: 0, is_manual: 1, duplicate_of: null, operator_name: operatorName, synced: 0 };
 }
 
 // Marks a raw finish as a backup device's corroborating entry for the same

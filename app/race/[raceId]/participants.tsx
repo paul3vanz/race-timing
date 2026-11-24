@@ -37,10 +37,13 @@ import {
   getParticipantsByRace,
   getRace,
   participantDisplayName as displayName,
+  setParticipantStatus,
+  setRaceFormat,
   setRaceMaxBib,
   updateParticipantDetails,
   upsertParticipant,
   type Participant,
+  type ParticipantStatus,
   type Race,
 } from '@/lib/db';
 
@@ -232,6 +235,39 @@ export default function ParticipantsScreen() {
     }
   };
 
+  // ── DNS / DNF ─────────────────────────────────────────────────────────────────
+
+  const [search, setSearch] = useState('');
+  const visibleParticipants = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return participants;
+    return participants.filter(
+      (p) => p.bib_number.toLowerCase().startsWith(q) || displayName(p).toLowerCase().includes(q),
+    );
+  }, [participants, search]);
+  const dnsCount = participants.filter((p) => p.status === 'dns').length;
+  const dnfCount = participants.filter((p) => p.status === 'dnf').length;
+
+  const saveStatus = async (p: Participant, status: ParticipantStatus | null) => {
+    await setParticipantStatus(db, p.id, status);
+    await load();
+  };
+
+  const handleStatus = (p: Participant) => {
+    Alert.alert(`Bib ${p.bib_number}: ${displayName(p)}`, 'Mark this entrant as:', [
+      { text: 'DNS (did not start)', onPress: () => saveStatus(p, 'dns') },
+      { text: 'DNF (did not finish)', onPress: () => saveStatus(p, 'dnf') },
+      p.status
+        ? { text: 'Clear, they are racing', onPress: () => saveStatus(p, null) }
+        : { text: 'Cancel', style: 'cancel' },
+    ]);
+  };
+
+  const handleToggleFormat = async (laps: boolean) => {
+    await setRaceFormat(db, raceId, laps ? 'laps' : 'single');
+    await load();
+  };
+
   const handleClearAll = async () => {
     setConfirmingClear(false);
     await deleteParticipantsByRace(db, raceId);
@@ -252,25 +288,57 @@ export default function ParticipantsScreen() {
 
       <FlatList
         style={styles.list}
-        data={participants}
+        data={visibleParticipants}
         keyExtractor={(p) => p.id}
         // The Android nav bar / gesture area sits over the bottom of the screen,
         // so the last rows and the Clear buttons need to clear it.
         contentContainerStyle={{ paddingBottom: insets.bottom + 24 }}
         keyboardShouldPersistTaps="handled"
         ListHeaderComponent={
-          <View style={styles.header}>
-            <Text style={styles.count}>
-              {participants.length} participant{participants.length === 1 ? '' : 's'}
-            </Text>
-            <View style={styles.headerButtons}>
-              <Pressable style={styles.addBtn} onPress={() => setEntrantSheet({ mode: 'add', initial: null })}>
-                <Text style={styles.importBtnText}>+ Add</Text>
-              </Pressable>
-              <Pressable style={styles.importBtn} onPress={handlePickFile}>
-                <Text style={styles.importBtnText}>Import CSV</Text>
-              </Pressable>
+          <View>
+            <View style={styles.header}>
+              <Text style={styles.count}>
+                {participants.length} participant{participants.length === 1 ? '' : 's'}
+              </Text>
+              <View style={styles.headerButtons}>
+                <Pressable style={styles.addBtn} onPress={() => setEntrantSheet({ mode: 'add', initial: null })}>
+                  <Text style={styles.importBtnText}>+ Add</Text>
+                </Pressable>
+                <Pressable style={styles.importBtn} onPress={handlePickFile}>
+                  <Text style={styles.importBtnText}>Import CSV</Text>
+                </Pressable>
+              </View>
             </View>
+
+            <View style={styles.formatRow}>
+              <View style={styles.rowInfo}>
+                <Text style={styles.name}>Multi-lap race</Text>
+                <Text style={styles.meta}>
+                  {race?.format === 'laps'
+                    ? 'A bib crossing again counts as another lap.'
+                    : 'Single lap. A bib entered twice is flagged as a likely typo.'}
+                </Text>
+              </View>
+              <Switch value={race?.format === 'laps'} onValueChange={handleToggleFormat} />
+            </View>
+
+            {participants.length > 0 && (
+              <>
+                <TextInput
+                  style={styles.search}
+                  placeholder="Find by bib or name"
+                  placeholderTextColor="#555"
+                  value={search}
+                  onChangeText={setSearch}
+                  autoCorrect={false}
+                  clearButtonMode="while-editing"
+                />
+                <Text style={styles.statusSummary}>
+                  {dnsCount} DNS · {dnfCount} DNF. Tap the status button on an entrant to mark them as not starting or
+                  not finishing, so they are not chased on Results.
+                </Text>
+              </>
+            )}
           </View>
         }
         ListEmptyComponent={
@@ -308,7 +376,15 @@ export default function ParticipantsScreen() {
                 </Text>
               )}
             </View>
-            <Text style={styles.editHint}>edit</Text>
+            <Pressable
+              style={[styles.statusBtn, item.status && styles.statusBtnSet]}
+              onPress={() => handleStatus(item)}
+              hitSlop={6}
+            >
+              <Text style={[styles.statusBtnText, item.status && styles.statusBtnTextSet]}>
+                {item.status ? item.status.toUpperCase() : 'DNS/DNF'}
+              </Text>
+            </Pressable>
           </Pressable>
         )}
         ListFooterComponent={
@@ -522,9 +598,57 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     borderRadius: 10,
   },
-  editHint: {
-    color: '#444',
+  formatRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginHorizontal: 16,
+    marginBottom: 12,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: '#161616',
+  },
+  search: {
+    marginHorizontal: 16,
+    backgroundColor: '#161616',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#2a2a2a',
+    color: '#fff',
+    fontSize: 16,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  statusSummary: {
+    color: '#666',
     fontSize: 12,
+    lineHeight: 17,
+    marginHorizontal: 16,
+    marginTop: 8,
+    marginBottom: 8,
+  },
+  statusBtn: {
+    borderWidth: 1,
+    borderColor: '#333',
+    borderRadius: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 8,
+    minWidth: 64,
+    alignItems: 'center',
+  },
+  statusBtnSet: {
+    borderColor: '#f59e0b',
+    backgroundColor: '#2b1f00',
+  },
+  statusBtnText: {
+    color: '#666',
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  statusBtnTextSet: {
+    color: '#f59e0b',
+    fontSize: 13,
+    fontWeight: '800',
   },
   importBtn: {
     backgroundColor: '#1b5e20',

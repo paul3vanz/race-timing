@@ -5,9 +5,11 @@ import { useSQLiteContext } from 'expo-sqlite';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
+import { BibCheckSheet } from '@/components/bib-check-sheet';
 import { Numpad } from '@/components/numpad';
 import { useRaceStartPoll } from '@/hooks/use-race-start-poll';
 import { useRaceSync } from '@/hooks/use-race-sync';
+import { checkBibEntry, type BibIssue } from '@/lib/bib-check';
 import { participantDisplayName } from '@/lib/db';
 import { isActiveFinish, isActiveTap, isManualDevice } from '@/lib/merge';
 import { useRaceStore } from '@/lib/store';
@@ -67,6 +69,8 @@ export default function BibScreen() {
   const [bib, setBib] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  // Problems with the bib just entered, awaiting keep/undo from the operator.
+  const [check, setCheck] = useState<BibIssue[]>([]);
   const [elapsed, setElapsed] = useState(0);
   // Tick every 30 s so the stale-timestamp warning refreshes without user input
   const [, setTick] = useState(0);
@@ -117,24 +121,25 @@ export default function BibScreen() {
   const submit = async (bibNumber: string) => {
     if (!activeRace?.start_time) return;
     setSubmitting(true);
-    // A bib that already has a result is accepted, not blocked: the operator
-    // keeps the queue moving and the Results screen flags both rows so the
-    // wrong one (usually transposed digits) can be corrected there.
-    const clash = finishes.find(
-      (f) => isActiveFinish(f) && f.bib_number === bibNumber && f.source === (lineMode ? 'line' : 'funnel'),
-    );
+    // An unexpected bib (marked DNS/DNF, not on the start list, or already
+    // finished in a single-lap race) is saved straight away so it keeps its
+    // place against the tap, then the funnel recorder is asked to confirm it
+    // or undo and retype while the runner is still in front of them.
+    const issues = lineMode
+      ? []
+      : checkBibEntry({ bib: bibNumber, participants, finishes, format: activeRace.format });
+    const clash = lineMode
+      ? finishes.find((f) => isActiveFinish(f) && f.bib_number === bibNumber && f.source === 'line')
+      : undefined;
     try {
       Haptics.notificationAsync(
-        clash ? Haptics.NotificationFeedbackType.Warning : Haptics.NotificationFeedbackType.Success,
+        clash || issues.length > 0
+          ? Haptics.NotificationFeedbackType.Warning
+          : Haptics.NotificationFeedbackType.Success,
       );
-      await assignBib(db, bibNumber);
-      setNotice(
-        clash
-          ? lineMode
-            ? `Bib ${bibNumber} was already entered at the finish line.`
-            : `Bib ${bibNumber} was already entered. Both are flagged on Results.`
-          : null,
-      );
+      const saved = await assignBib(db, bibNumber);
+      setNotice(clash ? `Bib ${bibNumber} was already entered at the finish line.` : null);
+      if (saved && issues.length > 0) setCheck(issues);
     } catch (e) {
       setNotice(`Could not save bib ${bibNumber}: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -147,6 +152,17 @@ export default function BibScreen() {
   const handleUndo = () => {
     setNotice(null);
     undoLastBib(db);
+  };
+
+  const handleCheckKeep = () => {
+    const repeat = check.find((i) => i.kind === 'repeat');
+    setCheck([]);
+    if (repeat) setNotice(`Bib ${repeat.bib} kept twice. Both entries are flagged on Results.`);
+  };
+
+  const handleCheckUndo = () => {
+    setCheck([]);
+    handleUndo();
   };
 
   const handleChangeMode = () => {
@@ -346,8 +362,10 @@ export default function BibScreen() {
           onDelete={handleDelete}
           onConfirm={handleConfirm}
           canConfirm={bib.length > 0}
-          disabled={waiting || submitting}
+          disabled={waiting || submitting || check.length > 0}
         />
+
+        <BibCheckSheet issues={check} onKeep={handleCheckKeep} onUndo={handleCheckUndo} />
 
       </View>
     </>

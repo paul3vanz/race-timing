@@ -11,7 +11,7 @@
 // Everything here is pure — plain rows in, plain data out, nothing touches a
 // database — which is what makes the multi-device behaviour unit-testable.
 
-import type { Finish, Participant, Timestamp } from './db';
+import type { Finish, Participant, ParticipantStatus, RaceFormat, Timestamp } from './db';
 import {
   alignFinishers,
   clusterBibEntries,
@@ -156,7 +156,15 @@ export function labelDevices(
   thisDeviceId: string | null,
 ): Map<string, DeviceLabel> {
   const labels = new Map<string, DeviceLabel>();
-  const suffix = (id: string) => (id === thisDeviceId ? ' (this device)' : '');
+  // The name entered on each device, so "Timer 1" reads as a person.
+  const operatorOf = new Map<string, string>();
+  for (const row of [...taps, ...finishes]) {
+    if (row.operator_name) operatorOf.set(row.device_id, row.operator_name);
+  }
+  const suffix = (id: string) => {
+    const name = operatorOf.get(id);
+    return `${name ? ` · ${name}` : ''}${id === thisDeviceId ? ' (this device)' : ''}`;
+  };
 
   const firstTap = new Map<string, number>();
   for (const t of taps) {
@@ -414,6 +422,7 @@ export interface RowFlags {
   unknownBib: boolean; // not on the start list — very often a typo
   missingTimers: string[]; // short labels of Timers that have no tap for this finisher
   lowConfidence: boolean;
+  withdrawn: ParticipantStatus | null; // entrant marked DNS/DNF yet has a result
 }
 
 export type ResultRow =
@@ -480,6 +489,11 @@ export interface ResultsView {
   needsReview: number;
   duplicateBibs: string[];
   timerDevices: number;
+  // Start-list reconciliation: entrants expected to finish (not DNS/DNF) with
+  // no result yet, and how many are marked DNS/DNF.
+  stillOut: number;
+  dns: number;
+  dnf: number;
 }
 
 function nameOf(p: Participant | undefined): string | null {
@@ -493,8 +507,11 @@ export function buildResultsView(input: {
   participants: Participant[];
   startTime: number | null;
   thisDeviceId: string | null;
+  format?: RaceFormat; // defaults to 'single'
 }): ResultsView {
   const { taps, finishes, participants, thisDeviceId } = input;
+  // In a lapped race a bib appearing again is the next lap, not a problem.
+  const lapped = input.format === 'laps';
   const startTime = input.startTime ?? 0;
 
   const model = buildModel(taps, finishes);
@@ -524,10 +541,11 @@ export function buildResultsView(input: {
   const drafts: Draft[] = [];
 
   const flagsFor = (bib: string, dupBibs: Set<string>, missing: string[], low: boolean): RowFlags => ({
-    dupBib: dupBibs.has(bib),
+    dupBib: !lapped && dupBibs.has(bib),
     unknownBib: hasRoster && !participantByBib.has(bib),
     missingTimers: missing.map(shortOf),
     lowConfidence: low,
+    withdrawn: participantByBib.get(bib)?.status ?? null,
   });
 
   for (const cluster of model.clusters) {
@@ -667,7 +685,7 @@ export function buildResultsView(input: {
 
   const bibCounts = new Map<string, number>();
   for (const d of drafts) if (d.bib) bibCounts.set(d.bib, (bibCounts.get(d.bib) ?? 0) + 1);
-  const duplicateBibs = [...bibCounts.entries()].filter(([, n]) => n > 1).map(([bib]) => bib);
+  const duplicateBibs = lapped ? [] : [...bibCounts.entries()].filter(([, n]) => n > 1).map(([bib]) => bib);
   const dupSet = new Set(duplicateBibs);
 
   let pos = 0;
@@ -684,6 +702,7 @@ export function buildResultsView(input: {
       r.flags.dupBib ||
       r.flags.unknownBib ||
       r.flags.lowConfidence ||
+      r.flags.withdrawn !== null ||
       r.flags.missingTimers.length > 0 ||
       r.line?.status === 'disagrees'
     );
@@ -715,6 +734,17 @@ export function buildResultsView(input: {
   }
   devices.sort((a, b) => a.label.short.localeCompare(b.label.short));
 
+  // Every bib with any entry (results, proposals, unmatched) counts as in.
+  const bibsIn = new Set(bibCounts.keys());
+  let stillOut = 0;
+  let dns = 0;
+  let dnf = 0;
+  for (const p of participants) {
+    if (p.status === 'dns') dns += 1;
+    else if (p.status === 'dnf') dnf += 1;
+    else if (!bibsIn.has(p.bib_number)) stillOut += 1;
+  }
+
   return {
     rows,
     finishers: computeFinishers(model, startTime),
@@ -725,6 +755,9 @@ export function buildResultsView(input: {
     needsReview,
     duplicateBibs,
     timerDevices: coverage.size,
+    stillOut,
+    dns,
+    dnf,
   };
 }
 

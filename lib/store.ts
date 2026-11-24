@@ -41,6 +41,12 @@ interface RaceStore {
   // Persisted across launches
   deviceId: string | null;
   bibMode: BibMode;
+  // Who is using this device ("First Last"), written onto every tap and bib so
+  // the data can be traced back to a person. Null until entered.
+  operatorName: string | null;
+  // False until the persisted settings have been read, so the name prompt
+  // doesn't flash up before a saved name has loaded.
+  settingsLoaded: boolean;
 
   // Active race context — set when a race screen is opened
   activeRace: Race | null;
@@ -67,6 +73,8 @@ interface RaceStore {
   initDeviceId: () => Promise<void>;
 
   setBibMode: (mode: BibMode) => Promise<void>;
+
+  setOperatorName: (name: string | null) => Promise<void>;
 
   // Load (or reload) all race data into the store
   loadRace: (db: SQLiteDatabase, raceId: string) => Promise<void>;
@@ -128,24 +136,34 @@ async function resolveDeviceId(): Promise<string> {
 }
 
 const BIB_MODE_KEY = 'race_timing_bib_mode';
+const OPERATOR_NAME_KEY = 'race_timing_operator_name';
 
-async function readBibMode(): Promise<BibMode> {
+async function readSetting(key: string): Promise<string | null> {
   try {
-    const raw =
-      Platform.OS === 'web' ? localStorage.getItem(BIB_MODE_KEY) : await SecureStore.getItemAsync(BIB_MODE_KEY);
-    return raw === 'line' ? 'line' : 'funnel';
+    return Platform.OS === 'web' ? localStorage.getItem(key) : await SecureStore.getItemAsync(key);
   } catch {
-    return 'funnel';
+    return null;
   }
 }
 
-async function writeBibMode(mode: BibMode): Promise<void> {
+// Not persisting just means the setting reverts on restart.
+async function writeSetting(key: string, value: string | null): Promise<void> {
   try {
-    if (Platform.OS === 'web') localStorage.setItem(BIB_MODE_KEY, mode);
-    else await SecureStore.setItemAsync(BIB_MODE_KEY, mode);
+    if (Platform.OS === 'web') {
+      if (value === null) localStorage.removeItem(key);
+      else localStorage.setItem(key, value);
+    } else if (value === null) {
+      await SecureStore.deleteItemAsync(key);
+    } else {
+      await SecureStore.setItemAsync(key, value);
+    }
   } catch {
-    // Not persisting just means the device reverts to funnel on restart.
+    // ignore
   }
+}
+
+async function readBibMode(): Promise<BibMode> {
+  return (await readSetting(BIB_MODE_KEY)) === 'line' ? 'line' : 'funnel';
 }
 
 // ── Store ─────────────────────────────────────────────────────────────────────
@@ -153,6 +171,8 @@ async function writeBibMode(mode: BibMode): Promise<void> {
 export const useRaceStore = create<RaceStore>((set, get) => ({
   deviceId: null,
   bibMode: 'funnel',
+  operatorName: null,
+  settingsLoaded: false,
   activeRace: null,
   event: null,
   timestamps: [],
@@ -162,13 +182,23 @@ export const useRaceStore = create<RaceStore>((set, get) => ({
   entryStack: [],
 
   initDeviceId: async () => {
-    const [deviceId, bibMode] = await Promise.all([resolveDeviceId(), readBibMode()]);
-    set({ deviceId, bibMode });
+    const [deviceId, bibMode, operatorName] = await Promise.all([
+      resolveDeviceId(),
+      readBibMode(),
+      readSetting(OPERATOR_NAME_KEY),
+    ]);
+    set({ deviceId, bibMode, operatorName: operatorName?.trim() || null, settingsLoaded: true });
   },
 
   setBibMode: async (mode) => {
     set({ bibMode: mode });
-    await writeBibMode(mode);
+    await writeSetting(BIB_MODE_KEY, mode);
+  },
+
+  setOperatorName: async (name) => {
+    const clean = name?.replace(/\s+/g, ' ').trim() || null;
+    set({ operatorName: clean });
+    await writeSetting(OPERATOR_NAME_KEY, clean);
   },
 
   loadRace: async (db, raceId) => {
@@ -253,10 +283,10 @@ export const useRaceStore = create<RaceStore>((set, get) => ({
   recordTimestamp: async (db, capturedAt) => {
     // Capture the time first — before any async work — to stay accurate.
     const recordedAt = capturedAt ?? Date.now();
-    const { activeRace, deviceId, event } = get();
+    const { activeRace, deviceId, event, operatorName } = get();
     if (!activeRace || !deviceId || event?.status === 'finished') return null;
 
-    const ts = await dbRecordTimestamp(db, activeRace.id, deviceId, recordedAt);
+    const ts = await dbRecordTimestamp(db, activeRace.id, deviceId, recordedAt, operatorName);
     set((state) => {
       const timestamps = [...state.timestamps, ts];
       return { timestamps, unassigned: buildQueue(timestamps, state.finishes) };
@@ -266,13 +296,22 @@ export const useRaceStore = create<RaceStore>((set, get) => ({
 
   assignBib: async (db, bibNumber) => {
     const capturedAt = Date.now();
-    const { activeRace, unassigned, deviceId, event, bibMode } = get();
+    const { activeRace, unassigned, deviceId, event, bibMode, operatorName } = get();
     if (!activeRace?.start_time || !deviceId || event?.status === 'finished') return null;
 
     // Finish-line entries are timed as typed and leave the tap queue alone.
     const head = bibMode === 'funnel' ? unassigned[0] : undefined;
     const finish = head
-      ? await assignBibToTimestamp(db, activeRace.id, bibNumber, head.id, head.time - activeRace.start_time, deviceId)
+      ? await assignBibToTimestamp(
+          db,
+          activeRace.id,
+          bibNumber,
+          head.id,
+          head.time - activeRace.start_time,
+          deviceId,
+          operatorName,
+          capturedAt,
+        )
       : await recordDirectFinish(
           db,
           activeRace.id,
@@ -280,6 +319,8 @@ export const useRaceStore = create<RaceStore>((set, get) => ({
           capturedAt - activeRace.start_time,
           deviceId,
           bibMode === 'line' ? 'line' : 'funnel',
+          operatorName,
+          capturedAt,
         );
 
     set((state) => {

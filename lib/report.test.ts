@@ -14,6 +14,7 @@ function p(bib: string, gender: string | null, category: string | null, extra: P
     category,
     team_name: null,
     sub_category: null,
+    status: null,
     synced: 1,
     ...extra,
   };
