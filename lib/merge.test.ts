@@ -20,6 +20,7 @@ function tap(device: string, offsetMs: number, extra: Partial<Timestamp> = {}): 
     voided: 0,
     is_manual: 0,
     duplicate_of: null,
+    operator_name: null,
     synced: 0,
     ...extra,
   };
@@ -39,6 +40,8 @@ function finish(bib: string, timestampId: string | null, gunTime: number, extra:
     duplicate_of: null,
     voided: 0,
     source: 'funnel',
+    entered_at: null,
+    operator_name: null,
     synced: 0,
     ...extra,
   };
@@ -57,6 +60,7 @@ function runner(bib: string, extra: Partial<Participant> = {}): Participant {
     category: null,
     team_name: null,
     sub_category: null,
+    status: null,
     synced: 1,
     ...extra,
   };
@@ -348,5 +352,39 @@ describe('Timers + finish-line recorder + funnel recorder', () => {
     const v = view([], entries);
     expect(v.rows.map((r) => r.kind)).toEqual(['finisher', 'finisher']);
     expect(v.finishers).toHaveLength(2);
+  });
+});
+
+describe('Race format and start-list status', () => {
+  test('a single-lap race flags a repeated bib on both rows; a lapped race does not', () => {
+    const { a } = twoTimerRace(2);
+    const finishes = [finish('7', a[0].id, 10_000), finish('7', a[1].id, 20_000)];
+    const single = buildResultsView({ taps: a, finishes, participants: [], startTime: START, thisDeviceId: 'bib' });
+    const finisherRows = single.rows.filter((r) => r.kind === 'finisher');
+    expect(finisherRows).toHaveLength(2);
+    expect(finisherRows.every((r) => r.kind === 'finisher' && r.flags.dupBib)).toBe(true);
+    expect(single.duplicateBibs).toEqual(['7']);
+
+    const laps = buildResultsView({ taps: a, finishes, participants: [], startTime: START, thisDeviceId: 'bib', format: 'laps' });
+    expect(laps.duplicateBibs).toEqual([]);
+    expect(laps.rows.some((r) => r.kind === 'finisher' && r.flags.dupBib)).toBe(false);
+  });
+
+  test('DNS/DNF entrants are counted apart from those still out, and flagged if they have a result', () => {
+    const { a } = twoTimerRace(1);
+    const participants = [runner('1', { status: 'dnf' }), runner('2', { status: 'dns' }), runner('3'), runner('4')];
+    const v = view(a, [finish('1', a[0].id, 10_000)], participants);
+    expect(v.dns).toBe(1);
+    expect(v.dnf).toBe(1);
+    expect(v.stillOut).toBe(2);
+    const row = v.rows.find((r) => r.kind === 'finisher');
+    expect(row?.kind === 'finisher' && row.flags.withdrawn).toBe('dnf');
+    expect(v.needsReview).toBe(1);
+  });
+
+  test('device labels carry the operator name', () => {
+    const t = tap('timer-a', 10_000, { operator_name: 'Jo Bloggs' });
+    const v = view([t], []);
+    expect(v.labels.get('timer-a')?.long).toBe('Timer 1 · Jo Bloggs');
   });
 });

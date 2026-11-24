@@ -1,6 +1,4 @@
-import { File, Paths } from 'expo-file-system';
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
-import * as Sharing from 'expo-sharing';
 import { useSQLiteContext } from 'expo-sqlite';
 import Papa from 'papaparse';
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -8,6 +6,9 @@ import { Alert, FlatList, Pressable, RefreshControl, StyleSheet, Text, View } fr
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { BibEditSheet, type SheetAction } from '@/components/bib-edit-sheet';
+import { ScreenErrorBoundary } from '@/components/screen-error-boundary';
+import { exportRawData, shareCsv } from '@/lib/export-file';
+import { csvFileSlug } from '@/lib/raw-export';
 import { DeviceActivityStrip, ResultRowView, type EditTarget } from '@/components/reconcile-row';
 import { useRaceSync } from '@/hooks/use-race-sync';
 import {
@@ -60,28 +61,50 @@ function buildCsv(
   });
 }
 
-async function exportCsv(raceName: string, csv: string) {
-  const slug = raceName.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
-  const file = new File(Paths.document, `${slug}-results.csv`);
-  file.write(csv);
-
-  const canShare = await Sharing.isAvailableAsync();
-  if (canShare) {
-    await Sharing.shareAsync(file.uri, {
-      mimeType: 'text/csv',
-      dialogTitle: 'Export Results',
-      UTI: 'public.comma-separated-values-text',
-    });
-  } else {
-    Alert.alert('Saved', `Results saved to:\n${file.uri}`);
-  }
-}
-
 // ── Screen ────────────────────────────────────────────────────────────────────
 
 type Sheet = { kind: 'edit'; target: EditTarget } | { kind: 'assign'; tap: CanonicalTap } | null;
 
-export default function ReviewScreen() {
+// If anything about building or drawing the results fails, the raw data must
+// still be one tap away: it never goes through the results merging.
+function ResultsFailed({ raceId, error, onRetry }: { raceId: string; error: Error; onRetry?: () => void }) {
+  const db = useSQLiteContext();
+  return (
+    <View style={styles.failed}>
+      <Text style={styles.failedTitle}>The results could not be shown</Text>
+      <Text style={styles.failedBody}>
+        Nothing recorded has been lost. Export the raw data to compile results in a spreadsheet, and please report this
+        message: {error.message}
+      </Text>
+      <Pressable style={styles.confirmAllBtn} onPress={() => exportRawData(db, raceId)}>
+        <Text style={styles.confirmAllBtnText}>Export raw data</Text>
+      </Pressable>
+      {onRetry && (
+        <Pressable style={styles.relinkBtn} onPress={onRetry}>
+          <Text style={styles.relinkBtnText}>Try again</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
+export default function ReviewScreenWithFallback() {
+  const { raceId } = useLocalSearchParams<{ raceId: string }>();
+  return (
+    <ScreenErrorBoundary
+      fallback={(error, retry) => (
+        <>
+          <Stack.Screen options={{ title: 'Results', headerRight: undefined }} />
+          <ResultsFailed raceId={raceId} error={error} onRetry={retry} />
+        </>
+      )}
+    >
+      <ReviewScreen />
+    </ScreenErrorBoundary>
+  );
+}
+
+function ReviewScreen() {
   const { raceId } = useLocalSearchParams<{ raceId: string }>();
   const db = useSQLiteContext();
   const router = useRouter();
@@ -120,8 +143,8 @@ export default function ReviewScreen() {
 
   const startTime = race?.start_time ?? null;
   const view = useMemo(
-    () => buildResultsView({ taps, finishes, participants, startTime, thisDeviceId: deviceId }),
-    [taps, finishes, participants, startTime, deviceId],
+    () => buildResultsView({ taps, finishes, participants, startTime, thisDeviceId: deviceId, format: race?.format }),
+    [taps, finishes, participants, startTime, deviceId, race?.format],
   );
 
   const bibPositions = useMemo(() => {
@@ -292,16 +315,30 @@ export default function ReviewScreen() {
     );
   };
 
-  const handleExport = async () => {
-    if (view.finishers.length === 0) {
-      Alert.alert('Nothing to export', 'Assign some bibs first.');
-      return;
-    }
+  const exportResults = async () => {
     try {
-      await exportCsv(race?.name ?? 'race', buildCsv(view.finishers, participants));
+      await shareCsv(
+        `${csvFileSlug(race?.name)}-results.csv`,
+        buildCsv(view.finishers, participants),
+        'Export results',
+      );
     } catch (e) {
       Alert.alert('Export failed', String(e));
     }
+  };
+
+  // The matched-up results need bibs; the raw data (taps and bibs as entered,
+  // with finish times) never does, so a Timer-only phone can always export.
+  const handleExport = () => {
+    if (view.finishers.length === 0) {
+      exportRawData(db, raceId);
+      return;
+    }
+    Alert.alert('Export CSV', 'Results are the matched-up finishers. Raw data is every tap and bib as entered.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Raw data', onPress: () => exportRawData(db, raceId) },
+      { text: 'Results', onPress: exportResults },
+    ]);
   };
 
   // ── Sheet content ───────────────────────────────────────────────────────────
@@ -392,6 +429,15 @@ export default function ReviewScreen() {
             </View>
 
             {sync.error ? <Text style={styles.syncError}>{sync.error}</Text> : null}
+
+            {participants.length > 0 && (
+              <Text style={styles.startList}>
+                {view.stillOut} still out on the course
+                {view.dns > 0 ? ` · ${view.dns} DNS` : ''}
+                {view.dnf > 0 ? ` · ${view.dnf} DNF` : ''}
+                {race?.format === 'laps' ? ' · multi-lap' : ''}
+              </Text>
+            )}
 
             <DeviceActivityStrip devices={view.devices} />
 
@@ -490,6 +536,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingTop: 8,
   },
+  startList: {
+    color: '#888',
+    fontSize: 12,
+    paddingHorizontal: 16,
+    paddingTop: 8,
+  },
   caption: {
     color: '#555',
     fontSize: 11,
@@ -542,6 +594,24 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 14,
     fontWeight: '700',
+  },
+  failed: {
+    flex: 1,
+    backgroundColor: '#0d0d0d',
+    paddingTop: 32,
+    gap: 16,
+  },
+  failedTitle: {
+    color: '#fff',
+    fontSize: 20,
+    fontWeight: '700',
+    paddingHorizontal: 16,
+  },
+  failedBody: {
+    color: '#999',
+    fontSize: 14,
+    lineHeight: 20,
+    paddingHorizontal: 16,
   },
   empty: {
     color: '#444',

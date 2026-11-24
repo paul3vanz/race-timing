@@ -7,6 +7,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import 'react-native-reanimated';
 
 import { DbErrorBoundary } from '@/components/db-error-boundary';
+import { OperatorNamePrompt } from '@/components/operator-name-prompt';
 import { SyncEngine } from '@/components/sync-engine';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { migrateDbIfNeeded } from '@/lib/db';
@@ -40,6 +41,7 @@ export default function RootLayout() {
             <Stack.Screen name="race/[raceId]/participants" options={{ headerShown: true }} />
             </Stack>
             <StatusBar style="auto" />
+            <OperatorNamePrompt />
           </ThemeProvider>
         </SQLiteProvider>
       </SafeAreaProvider>

@@ -7,6 +7,7 @@ import {
   Pressable,
   Share,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
@@ -63,6 +64,7 @@ export default function HomeScreen() {
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState('');
   const [newMaxBib, setNewMaxBib] = useState('999');
+  const [newMultiLap, setNewMultiLap] = useState(false);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
   const [confirmingStopId, setConfirmingStopId] = useState<string | null>(null);
   const [joining, setJoining] = useState(false);
@@ -104,10 +106,11 @@ export default function HomeScreen() {
     const today = new Date().toISOString().slice(0, 10);
     const maxBib = Math.max(1, parseInt(newMaxBib, 10) || 999);
     const event = await createEvent(db, { name, date: today, location: null, status: 'pending' });
-    await createRace(db, { event_id: event.id, name, start_time: null, wave: 1, max_bib: maxBib });
+    await createRace(db, { event_id: event.id, name, start_time: null, wave: 1, max_bib: maxBib, format: newMultiLap ? 'laps' : 'single' });
     setCreating(false);
     setNewName('');
     setNewMaxBib('999');
+    setNewMultiLap(false);
     await load();
   };
 
@@ -193,8 +196,19 @@ export default function HomeScreen() {
                     selectTextOnFocus
                   />
                 </View>
+                <View style={styles.maxBibRow}>
+                  <Text style={styles.maxBibLabel}>
+                    Multi-lap race{'\n'}
+                    <Text style={styles.formatHint}>
+                      {newMultiLap
+                        ? 'A bib crossing again is another lap'
+                        : 'Single lap: a bib crossing twice is flagged as a likely typo'}
+                    </Text>
+                  </Text>
+                  <Switch value={newMultiLap} onValueChange={setNewMultiLap} />
+                </View>
                 <View style={styles.createActions}>
-                  <Pressable style={styles.btnCancel} onPress={() => { setCreating(false); setNewName(''); setNewMaxBib('999'); }}>
+                  <Pressable style={styles.btnCancel} onPress={() => { setCreating(false); setNewName(''); setNewMaxBib('999'); setNewMultiLap(false); }}>
                     <Text style={styles.btnCancelText}>Cancel</Text>
                   </Pressable>
                   <Pressable style={[styles.btnCreate, !newName.trim() && styles.btnCreateDisabled]} onPress={handleCreate}>
@@ -546,6 +560,10 @@ const styles = StyleSheet.create({
   },
   createForm: {
     gap: 12,
+  },
+  formatHint: {
+    color: '#666',
+    fontSize: 12,
   },
   maxBibRow: {
     flexDirection: 'row',

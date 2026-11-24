@@ -231,6 +231,7 @@ function flagLines(flags: RowFlags, extraEntries: number): string[] {
   const lines: string[] = [];
   if (flags.dupBib) lines.push('Duplicate bib');
   if (flags.unknownBib) lines.push('Not on start list');
+  if (flags.withdrawn) lines.push(`Marked ${flags.withdrawn.toUpperCase()} on the start list`);
   if (extraEntries > 0) lines.push(`${extraEntries + 1} bibs entered for this tap`);
   if (flags.missingTimers.length > 0) lines.push(`${flags.missingTimers.join(', ')} did not tap`);
   if (flags.lowConfidence) lines.push('Low confidence match');

@@ -207,8 +207,8 @@ export async function pullRace(db: SQLiteDatabase, eventId: string, raceId: stri
       [event.id, event.name, event.date, event.location, event.status],
     );
     await db.runAsync(
-      `INSERT OR IGNORE INTO races (id, event_id, name, start_time, wave, max_bib, synced) VALUES (?, ?, ?, ?, ?, ?, 1)`,
-      [race.id, race.event_id, race.name, race.start_time, race.wave, race.max_bib],
+      `INSERT OR IGNORE INTO races (id, event_id, name, start_time, wave, max_bib, format, synced) VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+      [race.id, race.event_id, race.name, race.start_time, race.wave, race.max_bib, race.format === 'laps' ? 'laps' : 'single'],
     );
     for (const p of participantsRes.data ?? []) {
       await upsertParticipant(db, {
@@ -293,11 +293,14 @@ interface LocalParticipantRow {
   category: string | null;
   team_name: string | null;
   sub_category: string | null;
+  status: string | null;
   synced: number;
 }
 
 const participantSignature = (p: Omit<LocalParticipantRow, 'id' | 'synced' | 'bib_number'>) =>
-  [p.first_name, p.last_name, p.gender, p.dob, p.club, p.category, p.team_name, p.sub_category].join('|');
+  [p.first_name, p.last_name, p.gender, p.dob, p.club, p.category, p.team_name, p.sub_category, p.status].join('|');
+
+const asStatus = (v: unknown): string | null => (v === 'dns' || v === 'dnf' ? v : null);
 
 async function pullRaceDataNow(db: SQLiteDatabase, raceId: string): Promise<void> {
   if (!isSupabaseConfigured) return;
@@ -307,7 +310,9 @@ async function pullRaceDataNow(db: SQLiteDatabase, raceId: string): Promise<void
   // read as the signed-in (`authenticated`) session.
   await ensureAnonymousSession();
 
-  const raceRes = await supabase.from('races').select('start_time, event_id').eq('id', raceId).single();
+  // `*` rather than naming `format`, so a project that hasn't had the 20261124
+  // migration yet still pulls everything else.
+  const raceRes = await supabase.from('races').select('*').eq('id', raceId).single();
   if (raceRes.error) throw new Error(`pullRaceData (race): ${raceRes.error.message}`);
 
   const [eventRes, remoteTimestamps, remoteFinishes, remoteParticipants] = await Promise.all([
@@ -337,7 +342,7 @@ async function pullRaceDataNow(db: SQLiteDatabase, raceId: string): Promise<void
   const localParticipants = new Map(
     (
       await db.getAllAsync<LocalParticipantRow>(
-        'SELECT id, bib_number, first_name, last_name, gender, dob, club, category, team_name, sub_category, synced FROM participants WHERE race_id = ?',
+        'SELECT id, bib_number, first_name, last_name, gender, dob, club, category, team_name, sub_category, status, synced FROM participants WHERE race_id = ?',
         [raceId],
       )
     ).map((p) => [p.bib_number, p]),
@@ -350,6 +355,15 @@ async function pullRaceDataNow(db: SQLiteDatabase, raceId: string): Promise<void
       await db.runAsync('UPDATE races SET start_time = ? WHERE id = ? AND start_time IS NULL', [
         raceRes.data.start_time,
         raceId,
+      ]);
+    }
+    // Single lap / laps switched on another device. Same synced guard as finishes.
+    const remoteFormat = raceRes.data.format;
+    if (remoteFormat === 'laps' || remoteFormat === 'single') {
+      await db.runAsync('UPDATE races SET format = ? WHERE id = ? AND synced = 1 AND format != ?', [
+        remoteFormat,
+        raceId,
+        remoteFormat,
       ]);
     }
     // Race stopped or reopened on another device. Same synced guard as finishes.
@@ -365,9 +379,19 @@ async function pullRaceDataNow(db: SQLiteDatabase, raceId: string): Promise<void
       if (!local) {
         await db.runAsync(
           `INSERT INTO timestamps
-             (id, race_id, recorded_at, device_id, sequence_num, voided, is_manual, duplicate_of, synced)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
-          [t.id, t.race_id, t.recorded_at, t.device_id, t.sequence_num, voided, t.is_manual ? 1 : 0, t.duplicate_of ?? null],
+             (id, race_id, recorded_at, device_id, sequence_num, voided, is_manual, duplicate_of, operator_name, synced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+          [
+            t.id,
+            t.race_id,
+            t.recorded_at,
+            t.device_id,
+            t.sequence_num,
+            voided,
+            t.is_manual ? 1 : 0,
+            t.duplicate_of ?? null,
+            t.operator_name ?? null,
+          ],
         );
       } else if ((voided && !local.voided) || (t.duplicate_of && !local.duplicate_of)) {
         // synced is left alone on purpose: a still-pending local change keeps
@@ -395,8 +419,9 @@ async function pullRaceDataNow(db: SQLiteDatabase, raceId: string): Promise<void
       if (!local) {
         await db.runAsync(
           `INSERT INTO finishes
-             (id, race_id, bib_number, timestamp_id, gun_time, chip_time, device_id, flagged, duplicate_of, voided, source, synced)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+             (id, race_id, bib_number, timestamp_id, gun_time, chip_time, device_id, flagged, duplicate_of, voided, source,
+              entered_at, operator_name, synced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
           [
             f.id,
             f.race_id,
@@ -409,6 +434,8 @@ async function pullRaceDataNow(db: SQLiteDatabase, raceId: string): Promise<void
             remote.duplicate_of,
             remote.voided,
             remote.source,
+            f.entered_at ?? null,
+            f.operator_name ?? null,
           ],
         );
       } else if (local.synced === 1 && finishSignature(local) !== finishSignature(remote)) {
@@ -445,12 +472,13 @@ async function pullRaceDataNow(db: SQLiteDatabase, raceId: string): Promise<void
         category: (rp.category ?? null) as string | null,
         team_name: (rp.team_name ?? null) as string | null,
         sub_category: (rp.sub_category ?? null) as string | null,
+        status: asStatus(rp.status),
       };
       if (!local) {
         await db.runAsync(
           `INSERT INTO participants
-             (id, race_id, bib_number, first_name, last_name, gender, dob, club, category, team_name, sub_category, synced)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+             (id, race_id, bib_number, first_name, last_name, gender, dob, club, category, team_name, sub_category, status, synced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
           [
             rp.id,
             raceId,
@@ -463,12 +491,14 @@ async function pullRaceDataNow(db: SQLiteDatabase, raceId: string): Promise<void
             remote.category,
             remote.team_name,
             remote.sub_category,
+            remote.status,
           ],
         );
       } else if (local.synced === 1 && participantSignature(local) !== participantSignature(remote)) {
         await db.runAsync(
           `UPDATE participants
-           SET first_name = ?, last_name = ?, gender = ?, dob = ?, club = ?, category = ?, team_name = ?, sub_category = ?
+           SET first_name = ?, last_name = ?, gender = ?, dob = ?, club = ?, category = ?, team_name = ?, sub_category = ?,
+               status = ?
            WHERE id = ?`,
           [
             remote.first_name,
@@ -479,6 +509,7 @@ async function pullRaceDataNow(db: SQLiteDatabase, raceId: string): Promise<void
             remote.category,
             remote.team_name,
             remote.sub_category,
+            remote.status,
             local.id,
           ],
         );

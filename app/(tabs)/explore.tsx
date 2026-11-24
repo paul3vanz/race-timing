@@ -1,8 +1,12 @@
 import NetInfo from '@react-native-community/netinfo';
+import { useFocusEffect } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
+import { OperatorNameForm } from '@/components/operator-name-prompt';
+import { exportRawData } from '@/lib/export-file';
+import { useRaceStore } from '@/lib/store';
 import { countPending, pushPendingChanges } from '@/lib/sync';
 import { isSupabaseConfigured } from '@/lib/supabase';
 import { useSyncStore } from '@/lib/sync-store';
@@ -35,6 +39,21 @@ export default function SettingsScreen() {
   const syncFinished = useSyncStore((s) => s.syncFinished);
 
   const [syncingNow, setSyncingNow] = useState(false);
+  const operatorName = useRaceStore((s) => s.operatorName);
+  const [editingName, setEditingName] = useState(false);
+
+  // Races on this phone, for the raw data export. Read with a plain query so
+  // the export is reachable even if a race screen is failing to open.
+  const [races, setRaces] = useState<{ id: string; name: string; date: string | null }[]>([]);
+  useFocusEffect(
+    useCallback(() => {
+      db.getAllAsync<{ id: string; name: string; date: string | null }>(
+        'SELECT r.id, r.name, e.date FROM races r LEFT JOIN events e ON e.id = r.event_id ORDER BY e.date DESC, r.name',
+      )
+        .then(setRaces)
+        .catch(() => setRaces([]));
+    }, [db]),
+  );
 
   const handleSyncNow = async () => {
     if (!isSupabaseConfigured || syncingNow) return;
@@ -56,6 +75,26 @@ export default function SettingsScreen() {
   return (
     <ScrollView style={styles.root} contentContainerStyle={styles.content}>
       <Text style={styles.heading}>Settings</Text>
+
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Your name</Text>
+        <Text style={styles.bodyText}>Saved with every tap and bib recorded on this phone.</Text>
+        {editingName || !operatorName ? (
+          <OperatorNameForm
+            key={operatorName ?? 'none'}
+            initial={operatorName}
+            saveLabel="Save name"
+            onSaved={() => setEditingName(false)}
+          />
+        ) : (
+          <View style={styles.statRow}>
+            <Text style={styles.nameValue}>{operatorName}</Text>
+            <Pressable onPress={() => setEditingName(true)} hitSlop={8}>
+              <Text style={styles.linkText}>Change</Text>
+            </Pressable>
+          </View>
+        )}
+      </View>
 
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Live Sync</Text>
@@ -83,6 +122,27 @@ export default function SettingsScreen() {
         >
           <Text style={styles.syncBtnText}>{syncingNow ? 'Syncing…' : 'Sync Now'}</Text>
         </Pressable>
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Export raw data</Text>
+        <Text style={styles.bodyText}>
+          Every tap and bib recorded on this phone, in the order entered, with finish times. Works offline and does not
+          need the results to be matched up first.
+        </Text>
+        {races.length === 0 ? (
+          <Text style={styles.bodyText}>No races on this phone yet.</Text>
+        ) : (
+          races.map((r) => (
+            <Pressable key={r.id} style={styles.exportRow} onPress={() => exportRawData(db, r.id)}>
+              <View style={styles.exportInfo}>
+                <Text style={styles.exportName}>{r.name}</Text>
+                {r.date ? <Text style={styles.statLabel}>{r.date}</Text> : null}
+              </View>
+              <Text style={styles.linkText}>Export CSV</Text>
+            </Pressable>
+          ))
+        )}
       </View>
 
       {!isSupabaseConfigured && (
@@ -173,6 +233,32 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 15,
     fontWeight: '600',
+  },
+  nameValue: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  linkText: {
+    color: '#4caf50',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  exportRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#262626',
+  },
+  exportInfo: {
+    flex: 1,
+    gap: 2,
+  },
+  exportName: {
+    color: '#ddd',
+    fontSize: 15,
   },
   bodyText: {
     color: '#888',
